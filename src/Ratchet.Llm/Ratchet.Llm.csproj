@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodeStack.Ratchet.Llm</RootNamespace>
+    <AssemblyName>Ratchet.Llm</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
+  </ItemGroup>
+
+</Project>
