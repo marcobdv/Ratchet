@@ -29,7 +29,12 @@ setx RATCHET_SHELL "pwsh"             # persistent (new terminal to take effect)
 
 Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 
-## The whole thing in five files
+In-session commands: `/sessions` lists saved sessions, `/resume <id>` continues
+one, `/new` starts fresh, `/help` shows them. Sessions auto-save to
+`.ratchet/sessions/` after each turn; `ratchet -c` reopens the most recent.
+(Gitignore `.ratchet/` in real projects.)
+
+## The whole thing in six files
 
 | File | What it is |
 |---|---|
@@ -37,6 +42,7 @@ Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 | `Core/Conversation.cs` | The transcript + the four wire content-block shapes. |
 | `Core/ITool.cs` | The extension seam + registry. |
 | `Core/Tools.cs` | read / write / edit / bash. |
+| `Core/Sessions.cs` | Persist & resume the transcript (the agent's memory). |
 | `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand. |
 
 `Cli/Program.cs` is just wiring + a console observer + the REPL.
@@ -51,16 +57,23 @@ doc'd feature plugs in:
 - **`IAgentObserver`** → audit logging / TUI / ACP streaming hang off this.
 - **`BashTool` + `ShellSpec`** → shell is swappable (bash/cmd/pwsh) today; the
   ConPTY upgrade replaces the `Process` plumbing inside this one class.
+- **`ISessionStore`** → persistence is a seam too; a SQLite or cloud store drops
+  in behind it without touching the loop.
 
 ## What it deliberately does NOT do
 
-No context compaction, no sub-agents, no permission gates (YOLO bash, like pi),
-no session persistence. Each omission is a known next step, not an oversight.
-Add them one at a time — that's the curriculum.
+No context compaction, no sub-agents, no permission gates (YOLO bash, like pi).
+Each omission is a known next step, not an oversight. Add them one at a time —
+that's the curriculum.
 
-> **v0.1 — streaming.** Responses now stream over SSE: assistant text appears
+> **v0.1 — streaming.** Responses stream over SSE: assistant text appears
 > token-by-token, and tool-call arguments are reassembled from `input_json_delta`
-> fragments. See `Llm/AnthropicClient.ConsumeStreamAsync` for the event loop.
+> fragments. See `Llm/AnthropicClient.ConsumeStreamAsync`.
+>
+> **v0.2 — sessions.** Conversations auto-save to `.ratchet/sessions/` after each
+> turn (one JSON file each, same shape as the API wire format). `/sessions`,
+> `/resume <id>`, and `ratchet -c` bring them back. Resume is linear; pi's
+> tree-branching (`/branch`, rewind) is the next rung.
 
 ## Namespacing
 

@@ -32,10 +32,27 @@ var tools = new ToolRegistry(new ITool[]
 using var llm = new AnthropicClient(apiKey, model);
 var observer = new ConsoleObserver();
 var agent = new Agent(llm, tools, systemPrompt, observer);
+
+// Sessions live per-project under .ratchet/sessions/ in the working directory.
+// The transcript is the agent's whole memory, so persistence is just serializing it.
+var store = new FileSessionStore(Directory.GetCurrentDirectory());
 var conversation = new Conversation();
+string? sessionId = null;
+
+// `ratchet --continue` (or -c) reopens the most recent session in this folder.
+if (args.Any(a => a is "--continue" or "-c"))
+{
+    var latest = store.List().FirstOrDefault();
+    if (latest is not null)
+    {
+        conversation = store.Load(latest.Id)!;
+        sessionId = latest.Id;
+        Console.WriteLine($"continued session {sessionId} ({conversation.Messages.Count} messages)");
+    }
+}
 
 Console.WriteLine($"ratchet v0  ·  model: {model}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
-Console.WriteLine("Type a request. Ctrl+C to quit.\n");
+Console.WriteLine("Type a request, or /help for commands. Ctrl+C to quit.\n");
 
 // ---- the REPL: read a human line, run one agent turn, repeat --------------
 using var cts = new CancellationTokenSource();
@@ -51,11 +68,29 @@ while (!cts.IsCancellationRequested)
     if (line is null) break;                 // EOF (piped input ended)
     if (string.IsNullOrWhiteSpace(line)) continue;
 
+    // Slash-commands are handled locally and never sent to the model.
+    if (line.StartsWith('/'))
+    {
+        HandleCommand(line);
+        Console.WriteLine();
+        continue;
+    }
+
     conversation.Add(Message.UserText(line));
 
     try
     {
         await agent.RunTurnAsync(conversation, cts.Token);
+
+        // Auto-save after every completed turn — never lose work.
+        var wasNew = sessionId is null;
+        sessionId = store.Save(sessionId, conversation);
+        if (wasNew)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  · session {sessionId} (auto-saving)");
+            Console.ResetColor();
+        }
     }
     catch (OperationCanceledException)
     {
@@ -73,6 +108,49 @@ while (!cts.IsCancellationRequested)
 
 Console.WriteLine("bye.");
 return 0;
+
+// ---- slash-command handling (local; never hits the model) -----------------
+void HandleCommand(string input)
+{
+    var parts = input.Split(' ', 2, StringSplitOptions.TrimEntries);
+    var arg = parts.Length > 1 ? parts[1] : "";
+
+    switch (parts[0].ToLowerInvariant())
+    {
+        case "/sessions":
+            var sessions = store.List();
+            if (sessions.Count == 0) { Console.WriteLine("  (no saved sessions yet)"); break; }
+            foreach (var s in sessions)
+                Console.WriteLine($"  {s.Id}  ·  {s.MessageCount,3} msgs  ·  {s.UpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm}  ·  {s.Preview}");
+            break;
+
+        case "/resume":
+            if (arg.Length == 0) { Console.WriteLine("  usage: /resume <id>"); break; }
+            var loaded = store.Load(arg);
+            if (loaded is null) { Console.WriteLine($"  no session '{arg}'"); break; }
+            conversation = loaded;
+            sessionId = arg;
+            Console.WriteLine($"  resumed '{arg}' ({conversation.Messages.Count} messages)");
+            break;
+
+        case "/new":
+            conversation = new Conversation();
+            sessionId = null;
+            Console.WriteLine("  started a new session");
+            break;
+
+        case "/help":
+            Console.WriteLine("  /sessions       list saved sessions");
+            Console.WriteLine("  /resume <id>    load a session and continue");
+            Console.WriteLine("  /new            start a fresh session");
+            Console.WriteLine("  Ctrl+C          quit");
+            break;
+
+        default:
+            Console.WriteLine($"  unknown command '{parts[0]}' — try /help");
+            break;
+    }
+}
 
 static string BuildSystemPrompt()
 {
