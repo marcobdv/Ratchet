@@ -7,13 +7,13 @@ namespace CodeStack.Ratchet.Llm;
 
 /// <summary>
 /// A hand-rolled Anthropic Messages API client — no SDK. The point of v0 is to
-/// see the wire format, so this builds the request JSON by hand and parses the
-/// response content blocks by hand. Swapping providers later means writing a
+/// see the wire format, so this builds the request JSON by hand and consumes the
+/// streamed SSE response by hand. Swapping providers later means writing a
 /// sibling of this class behind the same ILlmClient seam.
 ///
-/// Endpoint:    POST https://api.anthropic.com/v1/messages
+/// Endpoint:    POST https://api.anthropic.com/v1/messages  (stream: true)
 /// Auth:        x-api-key header + anthropic-version header
-/// Loop signal: response.stop_reason == "tool_use"
+/// Loop signal: message_delta carries stop_reason == "tool_use"
 /// </summary>
 public sealed class AnthropicClient : ILlmClient, IDisposable
 {
@@ -37,17 +37,27 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         string systemPrompt,
         Conversation conversation,
         IReadOnlyCollection<ITool> tools,
+        Action<string> onTextDelta,
         CancellationToken ct)
     {
         var requestJson = BuildRequestJson(systemPrompt, conversation, tools);
-        using var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
-        using var resp = await _http.PostAsync(Endpoint, content, ct);
+        using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
+        {
+            Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
+        };
 
-        var body = await resp.Content.ReadAsStringAsync(ct);
+        // ResponseHeadersRead: start reading the body as it arrives instead of
+        // buffering the whole response — that's what makes streaming "live".
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (!resp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {body}");
+        {
+            var err = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {err}");
+        }
 
-        return ParseResponse(body);
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream);
+        return await ConsumeStreamAsync(reader, onTextDelta, ct);
     }
 
     // ---- request building -------------------------------------------------
@@ -63,6 +73,7 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         w.WriteStartObject();
         w.WriteString("model", _model);
         w.WriteNumber("max_tokens", _maxTokens);
+        w.WriteBoolean("stream", true);
         w.WriteString("system", systemPrompt);
 
         WriteTools(w, tools);
@@ -138,38 +149,129 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         }
     }
 
-    // ---- response parsing -------------------------------------------------
+    // ---- response parsing (SSE) -------------------------------------------
 
-    private static LlmResponse ParseResponse(string body)
+    /// <summary>
+    /// Consume the Server-Sent Events stream and rebuild the assistant message.
+    ///
+    /// The Messages API streams a sequence of typed events. The ones that matter:
+    ///   message_start        -> input token count
+    ///   content_block_start  -> a new block begins (text, or tool_use with id+name)
+    ///   content_block_delta  -> text_delta (live text) OR input_json_delta (tool args)
+    ///   content_block_stop   -> that block is complete
+    ///   message_delta        -> stop_reason + final output token count
+    ///   message_stop         -> end of stream
+    ///
+    /// Text deltas are emitted live; tool-call arguments arrive as JSON fragments
+    /// that we concatenate per block index, then parse as a whole at the end.
+    /// </summary>
+    private static async Task<LlmResponse> ConsumeStreamAsync(
+        StreamReader reader, Action<string> onTextDelta, CancellationToken ct)
     {
-        using var doc = JsonDocument.Parse(body);
-        var root = doc.RootElement;
+        var builders = new SortedDictionary<int, BlockBuilder>();
+        int inputTokens = 0, outputTokens = 0;
+        var stopReason = "end_turn";
 
-        var blocks = new List<ContentBlock>();
-        foreach (var item in root.GetProperty("content").EnumerateArray())
+        string? line;
+        while ((line = await reader.ReadLineAsync(ct)) is not null)
         {
-            var type = item.GetProperty("type").GetString();
+            // SSE: events are separated by blank lines; we only need the data: rows.
+            if (line.Length == 0 || line.StartsWith("event:", StringComparison.Ordinal))
+                continue;
+            if (!line.StartsWith("data:", StringComparison.Ordinal))
+                continue;
+
+            var payload = line.AsSpan(5).Trim();
+            if (payload.IsEmpty)
+                continue;
+
+            using var doc = JsonDocument.Parse(payload.ToString());
+            var root = doc.RootElement;
+            var type = root.GetProperty("type").GetString();
+
             switch (type)
             {
-                case "text":
-                    blocks.Add(new TextBlock(item.GetProperty("text").GetString() ?? ""));
+                case "message_start":
+                    if (root.TryGetProperty("message", out var m) &&
+                        m.TryGetProperty("usage", out var u0) &&
+                        u0.TryGetProperty("input_tokens", out var it))
+                        inputTokens = it.GetInt32();
                     break;
 
-                case "tool_use":
-                    blocks.Add(new ToolUseBlock(
-                        item.GetProperty("id").GetString()!,
-                        item.GetProperty("name").GetString()!,
-                        item.GetProperty("input").GetRawText()));
+                case "content_block_start":
+                {
+                    var idx = root.GetProperty("index").GetInt32();
+                    var cb = root.GetProperty("content_block");
+                    var cbType = cb.GetProperty("type").GetString()!;
+                    var b = new BlockBuilder { Type = cbType };
+                    if (cbType == "tool_use")
+                    {
+                        b.Id = cb.GetProperty("id").GetString();
+                        b.Name = cb.GetProperty("name").GetString();
+                    }
+                    builders[idx] = b;
                     break;
+                }
+
+                case "content_block_delta":
+                {
+                    var idx = root.GetProperty("index").GetInt32();
+                    if (!builders.TryGetValue(idx, out var b)) break;
+                    var delta = root.GetProperty("delta");
+                    switch (delta.GetProperty("type").GetString())
+                    {
+                        case "text_delta":
+                            var t = delta.GetProperty("text").GetString() ?? "";
+                            b.Text.Append(t);
+                            onTextDelta(t);          // <-- live output
+                            break;
+                        case "input_json_delta":
+                            b.Json.Append(delta.GetProperty("partial_json").GetString() ?? "");
+                            break;
+                    }
+                    break;
+                }
+
+                case "message_delta":
+                    if (root.TryGetProperty("delta", out var md) &&
+                        md.TryGetProperty("stop_reason", out var sr) &&
+                        sr.ValueKind == JsonValueKind.String)
+                        stopReason = sr.GetString()!;
+                    if (root.TryGetProperty("usage", out var u1) &&
+                        u1.TryGetProperty("output_tokens", out var ot))
+                        outputTokens = ot.GetInt32();
+                    break;
+
+                case "error":
+                    var msg = root.TryGetProperty("error", out var e) &&
+                              e.TryGetProperty("message", out var em)
+                        ? em.GetString() : "unknown streaming error";
+                    throw new InvalidOperationException($"Anthropic stream error: {msg}");
+
+                // content_block_stop / message_stop / ping: nothing to do.
             }
         }
 
-        var stopReason = root.GetProperty("stop_reason").GetString() ?? "end_turn";
-        var usage = root.GetProperty("usage");
-        var inTokens = usage.GetProperty("input_tokens").GetInt32();
-        var outTokens = usage.GetProperty("output_tokens").GetInt32();
+        var blocks = new List<ContentBlock>(builders.Count);
+        foreach (var b in builders.Values)
+        {
+            if (b.Type == "text")
+                blocks.Add(new TextBlock(b.Text.ToString()));
+            else if (b.Type == "tool_use")
+                blocks.Add(new ToolUseBlock(b.Id!, b.Name!, b.Json.Length == 0 ? "{}" : b.Json.ToString()));
+        }
 
-        return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, inTokens, outTokens);
+        return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, inputTokens, outputTokens);
+    }
+
+    /// <summary>Accumulates one streamed content block across its delta events.</summary>
+    private sealed class BlockBuilder
+    {
+        public string Type = "";
+        public string? Id;
+        public string? Name;
+        public readonly StringBuilder Text = new();
+        public readonly StringBuilder Json = new();
     }
 
     public void Dispose() => _http.Dispose();

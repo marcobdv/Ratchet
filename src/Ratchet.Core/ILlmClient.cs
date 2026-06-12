@@ -1,16 +1,24 @@
 namespace CodeStack.Ratchet.Core;
 
 /// <summary>
-/// The one model call. Everything provider-specific (Anthropic vs OpenAI wire
-/// formats) lives behind this seam. The loop only knows "send the transcript +
-/// tool specs, get an assistant message back".
+/// One streamed model call. Everything provider-specific (Anthropic vs OpenAI
+/// wire formats) lives behind this seam. The loop only knows "send the transcript
+/// + tool specs, get an assistant message back".
 /// </summary>
 public interface ILlmClient
 {
+    /// <summary>
+    /// One streamed model call. Text fragments are delivered live via
+    /// <paramref name="onTextDelta"/> as they arrive; the fully assembled
+    /// assistant message (text + any tool-use blocks) is returned at the end so
+    /// the loop's structure is unchanged. The provider's wire format (SSE event
+    /// stream, partial-JSON tool args) stays hidden behind this seam.
+    /// </summary>
     Task<LlmResponse> CompleteAsync(
         string systemPrompt,
         Conversation conversation,
         IReadOnlyCollection<ITool> tools,
+        Action<string> onTextDelta,
         CancellationToken ct);
 }
 

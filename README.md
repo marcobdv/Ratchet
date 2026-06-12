@@ -37,7 +37,7 @@ Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 | `Core/Conversation.cs` | The transcript + the four wire content-block shapes. |
 | `Core/ITool.cs` | The extension seam + registry. |
 | `Core/Tools.cs` | read / write / edit / bash. |
-| `Llm/AnthropicClient.cs` | Wire-level Messages API — builds & parses JSON by hand. |
+| `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand. |
 
 `Cli/Program.cs` is just wiring + a console observer + the REPL.
 
@@ -54,9 +54,13 @@ doc'd feature plugs in:
 
 ## What it deliberately does NOT do
 
-No streaming, no context compaction, no sub-agents, no permission gates (YOLO
-bash, like pi), no session persistence. Each omission is a known next step, not
-an oversight. Add them one at a time — that's the curriculum.
+No context compaction, no sub-agents, no permission gates (YOLO bash, like pi),
+no session persistence. Each omission is a known next step, not an oversight.
+Add them one at a time — that's the curriculum.
+
+> **v0.1 — streaming.** Responses now stream over SSE: assistant text appears
+> token-by-token, and tool-call arguments are reassembled from `input_json_delta`
+> fragments. See `Llm/AnthropicClient.ConsumeStreamAsync` for the event loop.
 
 ## Namespacing
 

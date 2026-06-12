@@ -94,11 +94,16 @@ static string BuildSystemPrompt()
 /// </summary>
 sealed class ConsoleObserver : IAgentObserver
 {
-    public void OnAssistantText(string text)
+    public void OnAssistantTextDelta(string delta)
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine(text);
+        Console.Write(delta);                 // no newline — fragments flow inline
+    }
+
+    public void OnAssistantTextEnd()
+    {
         Console.ResetColor();
+        Console.WriteLine();                  // close the streamed line
     }
 
     public void OnToolCall(string toolName, string inputJson)

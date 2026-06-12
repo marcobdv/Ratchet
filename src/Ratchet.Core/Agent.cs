@@ -4,7 +4,7 @@ namespace CodeStack.Ratchet.Core;
 /// The agent loop. This is the whole idea of a coding agent in one method:
 ///
 ///   1. Send the transcript + tool specs to the model.
-///   2. Print whatever text the model said.
+///   2. Stream its text out live as it arrives.
 ///   3. If the model asked for tools (stop_reason == "tool_use"):
 ///        run each tool, append the results as a user message, and loop.
 ///      Otherwise: the turn is done, hand control back to the human.
@@ -36,16 +36,16 @@ public sealed class Agent
     {
         while (true)
         {
-            var response = await _llm.CompleteAsync(_systemPrompt, conversation, _tools.All, ct);
-            conversation.Add(response.AssistantMessage);
-            _observer.OnUsage(response.InputTokens, response.OutputTokens);
+            // Text streams out live through the observer; the assembled message
+            // (with any tool-use blocks) still comes back for the loop to act on.
+            var streamedText = false;
+            void OnDelta(string d) { streamedText = true; _observer.OnAssistantTextDelta(d); }
 
-            // Surface any text the assistant produced this step.
-            foreach (var block in response.AssistantMessage.Content)
-            {
-                if (block is TextBlock text && !string.IsNullOrWhiteSpace(text.Text))
-                    _observer.OnAssistantText(text.Text);
-            }
+            var response = await _llm.CompleteAsync(_systemPrompt, conversation, _tools.All, OnDelta, ct);
+            conversation.Add(response.AssistantMessage);
+
+            if (streamedText) _observer.OnAssistantTextEnd();
+            _observer.OnUsage(response.InputTokens, response.OutputTokens);
 
             // No tool calls -> the assistant is done with this turn.
             var toolUses = response.AssistantMessage.Content.OfType<ToolUseBlock>().ToList();
@@ -93,7 +93,8 @@ public sealed class Agent
 /// </summary>
 public interface IAgentObserver
 {
-    void OnAssistantText(string text);
+    void OnAssistantTextDelta(string delta);
+    void OnAssistantTextEnd();
     void OnToolCall(string toolName, string inputJson);
     void OnToolResult(string toolName, string content, bool isError);
     void OnUsage(int inputTokens, int outputTokens);
