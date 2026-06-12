@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodeStack.Ratchet.Storage.Sqlite</RootNamespace>
+    <AssemblyName>Ratchet.Storage.Sqlite</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Bundled build: includes the native e_sqlite3 (JSON1 enabled). Bump to
+         the latest 9.0.x when restoring. -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -12,6 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
     <ProjectReference Include="..\Ratchet.Llm\Ratchet.Llm.csproj" />
+    <ProjectReference Include="..\Ratchet.Storage.Sqlite\Ratchet.Storage.Sqlite.csproj" />
   </ItemGroup>
 
 </Project>

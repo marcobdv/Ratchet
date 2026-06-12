@@ -34,6 +34,11 @@ branch tree), `/rewind [n]` (move HEAD back n turns), `/goto <node>` (jump to a
 branch tip), `/help`. Sessions auto-save to `.ratchet/sessions/` after each turn;
 `ratchet -c` reopens the most recent. (Gitignore `.ratchet/` in real projects.)
 
+Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
+JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
+`.ratchet/ratchet.db` and inserts only new nodes per turn (no full rewrite).
+Both implement the same `ISessionStore` seam.
+
 ## The whole thing in six files
 
 | File | What it is |
@@ -42,12 +47,13 @@ branch tip), `/help`. Sessions auto-save to `.ratchet/sessions/` after each turn
 | `Core/Conversation.cs` | The transcript + the four wire content-block shapes. |
 | `Core/ITool.cs` | The extension seam + registry. |
 | `Core/Tools.cs` | read / write / edit / bash. |
-| `Core/Sessions.cs` | Session **tree** (HEAD over a DAG) + persistence/resume. |
+| `Core/Sessions.cs` | Session **tree** (HEAD over a DAG) + the JSON-file store. |
 | `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand. |
 
-`Cli/Program.cs` is just wiring + a console observer + the REPL.
+`Cli/Program.cs` is wiring + a console observer + the REPL.
+`Storage.Sqlite/SqliteSessionStore.cs` is the optional SQLite backend.
 
-## Why it's split into three projects
+## Why it's split into projects
 
 So it grows toward the full Ratchet without a rewrite. Each seam is where a
 doc'd feature plugs in:
@@ -57,8 +63,10 @@ doc'd feature plugs in:
 - **`IAgentObserver`** → audit logging / TUI / ACP streaming hang off this.
 - **`BashTool` + `ShellSpec`** → shell is swappable (bash/cmd/pwsh) today; the
   ConPTY upgrade replaces the `Process` plumbing inside this one class.
-- **`ISessionStore`** → persistence is a seam too; a SQLite or cloud store drops
-  in behind it without touching the loop.
+- **`ISessionStore`** → persistence is a seam: `FileSessionStore` (JSON files)
+  and `SqliteSessionStore` (one DB, incremental inserts, recursive-CTE path
+  walks) both sit behind it. Pick with `RATCHET_STORE`; the loop never changes.
+  Core stays dependency-free — the SQLite adapter is a separate project.
 
 ## What it deliberately does NOT do
 
@@ -78,8 +86,13 @@ that's the curriculum.
 > pointer (the git model). `/rewind [n]` moves HEAD back whole turns; continuing
 > forks a new branch while the old line is preserved. `/tree` visualises it,
 > `/goto <node>` jumps between branch tips. Rewind is turn-level so HEAD always
-> lands on a valid boundary. Next rungs: context compaction, a second
-> `ILlmClient` to prove the provider seam.
+> lands on a valid boundary.
+>
+> **v0.4 — SQLite store.** `SqliteSessionStore` (separate project, keeps Core
+> dependency-free) implements `ISessionStore` over one `.ratchet/ratchet.db`.
+> Nodes are append-only, so each turn inserts just the new rows instead of
+> rewriting a whole file; recursive CTEs walk the parent chain. Opt in with
+> `RATCHET_STORE=sqlite`. Next rungs: context compaction, a second `ILlmClient`.
 
 ## Namespacing
 

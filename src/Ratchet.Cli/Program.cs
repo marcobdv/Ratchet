@@ -1,5 +1,6 @@
 using CodeStack.Ratchet.Core;
 using CodeStack.Ratchet.Llm;
+using CodeStack.Ratchet.Storage.Sqlite;
 
 // ---- configuration --------------------------------------------------------
 // API key from env so it never lands in source. Model is overridable so you can
@@ -35,7 +36,13 @@ var agent = new Agent(llm, tools, systemPrompt, observer);
 
 // Sessions are trees of message nodes (see SessionTree). The path root..HEAD is
 // the live conversation; rewinding HEAD and continuing forks a new branch.
-var store = new FileSessionStore(Directory.GetCurrentDirectory());
+// Storage backend: file (default) or sqlite. Both implement ISessionStore, so
+// nothing below this line knows or cares which is in use — that's the seam.
+ISessionStore store = (Environment.GetEnvironmentVariable("RATCHET_STORE")?.ToLowerInvariant()) switch
+{
+    "sqlite" => new SqliteSessionStore(Directory.GetCurrentDirectory()),
+    _ => new FileSessionStore(Directory.GetCurrentDirectory()),
+};
 var tree = new SessionTree();
 string? sessionId = null;
 
@@ -113,6 +120,7 @@ while (!cts.IsCancellationRequested)
     Console.WriteLine();
 }
 
+(store as IDisposable)?.Dispose();
 Console.WriteLine("bye.");
 return 0;
 
