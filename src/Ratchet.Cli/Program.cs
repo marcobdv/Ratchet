@@ -33,10 +33,10 @@ using var llm = new AnthropicClient(apiKey, model);
 var observer = new ConsoleObserver();
 var agent = new Agent(llm, tools, systemPrompt, observer);
 
-// Sessions live per-project under .ratchet/sessions/ in the working directory.
-// The transcript is the agent's whole memory, so persistence is just serializing it.
+// Sessions are trees of message nodes (see SessionTree). The path root..HEAD is
+// the live conversation; rewinding HEAD and continuing forks a new branch.
 var store = new FileSessionStore(Directory.GetCurrentDirectory());
-var conversation = new Conversation();
+var tree = new SessionTree();
 string? sessionId = null;
 
 // `ratchet --continue` (or -c) reopens the most recent session in this folder.
@@ -45,9 +45,9 @@ if (args.Any(a => a is "--continue" or "-c"))
     var latest = store.List().FirstOrDefault();
     if (latest is not null)
     {
-        conversation = store.Load(latest.Id)!;
+        tree = store.Load(latest.Id)!;
         sessionId = latest.Id;
-        Console.WriteLine($"continued session {sessionId} ({conversation.Messages.Count} messages)");
+        Console.WriteLine($"continued session {sessionId} ({tree.Count} nodes)");
     }
 }
 
@@ -76,15 +76,22 @@ while (!cts.IsCancellationRequested)
         continue;
     }
 
-    conversation.Add(Message.UserText(line));
+    // Add the human turn under HEAD, then run the agent over the root..HEAD path.
+    tree.Append(Message.UserText(line));
+    var conversation = tree.MaterializeConversation();
+    var baseCount = conversation.Messages.Count;
 
     try
     {
         await agent.RunTurnAsync(conversation, cts.Token);
 
-        // Auto-save after every completed turn — never lose work.
+        // Fold the new assistant/tool messages back into the tree as a chain,
+        // advancing HEAD — keeping the tree the single source of truth.
+        for (var i = baseCount; i < conversation.Messages.Count; i++)
+            tree.Append(conversation.Messages[i]);
+
         var wasNew = sessionId is null;
-        sessionId = store.Save(sessionId, conversation);
+        sessionId = store.Save(sessionId, tree);
         if (wasNew)
         {
             Console.ForegroundColor = ConsoleColor.DarkGray;
@@ -121,28 +128,50 @@ void HandleCommand(string input)
             var sessions = store.List();
             if (sessions.Count == 0) { Console.WriteLine("  (no saved sessions yet)"); break; }
             foreach (var s in sessions)
-                Console.WriteLine($"  {s.Id}  ·  {s.MessageCount,3} msgs  ·  {s.UpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm}  ·  {s.Preview}");
+                Console.WriteLine($"  {s.Id}  ·  {s.MessageCount,3} nodes  ·  {s.UpdatedUtc.ToLocalTime():yyyy-MM-dd HH:mm}  ·  {s.Preview}");
             break;
 
         case "/resume":
             if (arg.Length == 0) { Console.WriteLine("  usage: /resume <id>"); break; }
             var loaded = store.Load(arg);
             if (loaded is null) { Console.WriteLine($"  no session '{arg}'"); break; }
-            conversation = loaded;
+            tree = loaded;
             sessionId = arg;
-            Console.WriteLine($"  resumed '{arg}' ({conversation.Messages.Count} messages)");
+            Console.WriteLine($"  resumed '{arg}' ({tree.Count} nodes, head {tree.HeadId ?? "—"})");
             break;
 
         case "/new":
-            conversation = new Conversation();
+            tree = new SessionTree();
             sessionId = null;
             Console.WriteLine("  started a new session");
+            break;
+
+        case "/tree":
+            PrintTree();
+            break;
+
+        case "/rewind":
+            var n = 1;
+            if (arg.Length > 0 && !int.TryParse(arg, out n)) { Console.WriteLine("  usage: /rewind [n]"); break; }
+            tree.RewindTurns(n);
+            if (tree.Count > 0) sessionId = store.Save(sessionId, tree);
+            Console.WriteLine($"  rewound {n} turn(s) — head now {tree.HeadId ?? "(empty)"}. Continue to branch.");
+            break;
+
+        case "/goto":
+            if (arg.Length == 0) { Console.WriteLine("  usage: /goto <node-id>"); break; }
+            if (!tree.Goto(arg)) { Console.WriteLine($"  no node '{arg}' — see /tree"); break; }
+            if (tree.Count > 0) sessionId = store.Save(sessionId, tree);
+            Console.WriteLine($"  head now {arg}");
             break;
 
         case "/help":
             Console.WriteLine("  /sessions       list saved sessions");
             Console.WriteLine("  /resume <id>    load a session and continue");
             Console.WriteLine("  /new            start a fresh session");
+            Console.WriteLine("  /tree           show the session tree (► marks HEAD)");
+            Console.WriteLine("  /rewind [n]     move HEAD back n turns; continue to branch");
+            Console.WriteLine("  /goto <node>    jump HEAD to a node (e.g. another branch tip)");
             Console.WriteLine("  Ctrl+C          quit");
             break;
 
@@ -150,6 +179,45 @@ void HandleCommand(string input)
             Console.WriteLine($"  unknown command '{parts[0]}' — try /help");
             break;
     }
+}
+
+// Walk the tree depth-first from the roots, indenting by depth, marking HEAD.
+void PrintTree()
+{
+    if (tree.Count == 0) { Console.WriteLine("  (empty)"); return; }
+
+    void Walk(SessionTree.Node node, int depth)
+    {
+        var head = node.Id == tree.HeadId;
+        if (head) Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"  {(head ? "►" : " ")} {node.Id,3}  {new string(' ', depth * 2)}{Describe(node.Message)}");
+        if (head) Console.ResetColor();
+
+        foreach (var child in tree.ChildrenOf(node.Id))
+            Walk(child, depth + 1);
+    }
+
+    foreach (var root in tree.ChildrenOf(null))
+        Walk(root, 0);
+}
+
+static string Describe(Message m)
+{
+    var role = m.Role == Role.User ? "user" : "asst";
+    foreach (var b in m.Content)
+        if (b is TextBlock t && !string.IsNullOrWhiteSpace(t.Text))
+            return $"{role}: {Trunc(t.Text)}";
+
+    var tool = m.Content.OfType<ToolUseBlock>().FirstOrDefault();
+    if (tool is not null) return $"{role}: [tool {tool.Name}]";
+    if (m.Content.OfType<ToolResultBlock>().Any()) return $"{role}: [tool result]";
+    return $"{role}:";
+}
+
+static string Trunc(string s)
+{
+    s = s.ReplaceLineEndings(" ");
+    return s.Length > 50 ? s[..50] + "…" : s;
 }
 
 static string BuildSystemPrompt()

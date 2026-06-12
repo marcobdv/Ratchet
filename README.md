@@ -29,10 +29,10 @@ setx RATCHET_SHELL "pwsh"             # persistent (new terminal to take effect)
 
 Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 
-In-session commands: `/sessions` lists saved sessions, `/resume <id>` continues
-one, `/new` starts fresh, `/help` shows them. Sessions auto-save to
-`.ratchet/sessions/` after each turn; `ratchet -c` reopens the most recent.
-(Gitignore `.ratchet/` in real projects.)
+In-session commands: `/sessions`, `/resume <id>`, `/new`, `/tree` (show the
+branch tree), `/rewind [n]` (move HEAD back n turns), `/goto <node>` (jump to a
+branch tip), `/help`. Sessions auto-save to `.ratchet/sessions/` after each turn;
+`ratchet -c` reopens the most recent. (Gitignore `.ratchet/` in real projects.)
 
 ## The whole thing in six files
 
@@ -42,7 +42,7 @@ one, `/new` starts fresh, `/help` shows them. Sessions auto-save to
 | `Core/Conversation.cs` | The transcript + the four wire content-block shapes. |
 | `Core/ITool.cs` | The extension seam + registry. |
 | `Core/Tools.cs` | read / write / edit / bash. |
-| `Core/Sessions.cs` | Persist & resume the transcript (the agent's memory). |
+| `Core/Sessions.cs` | Session **tree** (HEAD over a DAG) + persistence/resume. |
 | `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand. |
 
 `Cli/Program.cs` is just wiring + a console observer + the REPL.
@@ -72,8 +72,14 @@ that's the curriculum.
 >
 > **v0.2 — sessions.** Conversations auto-save to `.ratchet/sessions/` after each
 > turn (one JSON file each, same shape as the API wire format). `/sessions`,
-> `/resume <id>`, and `ratchet -c` bring them back. Resume is linear; pi's
-> tree-branching (`/branch`, rewind) is the next rung.
+> `/resume <id>`, and `ratchet -c` bring them back.
+>
+> **v0.3 — branch tree.** A session is a *tree* of message nodes with a HEAD
+> pointer (the git model). `/rewind [n]` moves HEAD back whole turns; continuing
+> forks a new branch while the old line is preserved. `/tree` visualises it,
+> `/goto <node>` jumps between branch tips. Rewind is turn-level so HEAD always
+> lands on a valid boundary. Next rungs: context compaction, a second
+> `ILlmClient` to prove the provider seam.
 
 ## Namespacing
 
