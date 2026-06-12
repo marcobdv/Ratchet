@@ -31,15 +31,20 @@ Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 
 In-session commands: `/sessions`, `/resume <id>`, `/new`, `/tree` (show the
 branch tree), `/rewind [n]` (move HEAD back n turns), `/goto <node>` (jump to a
-branch tip), `/help`. Sessions auto-save to `.ratchet/sessions/` after each turn;
-`ratchet -c` reopens the most recent. (Gitignore `.ratchet/` in real projects.)
+branch tip), `/handover` (write a handover doc), `/handovers` (list them),
+`/help`. Sessions auto-save to `.ratchet/sessions/` after each turn; `ratchet -c`
+reopens the most recent. (Gitignore `.ratchet/` in real projects.)
 
 Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
 JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
 `.ratchet/ratchet.db` and inserts only new nodes per turn (no full rewrite).
 Both implement the same `ISessionStore` seam.
 
-## The whole thing in six files
+Resume cold from a handover with `ratchet --handover <session-id>`: a fresh
+session that carries the handover doc as its working set and gains a `recall`
+tool to page detail back out of the prior session.
+
+## The core files
 
 | File | What it is |
 |---|---|
@@ -48,6 +53,8 @@ Both implement the same `ISessionStore` seam.
 | `Core/ITool.cs` | The extension seam + registry. |
 | `Core/Tools.cs` | read / write / edit / bash. |
 | `Core/Sessions.cs` | Session **tree** (HEAD over a DAG) + the JSON-file store. |
+| `Core/Handover.cs` | Handover doc, prompt template, file store, generator. |
+| `Core/RecallTool.cs` | Retrieval back into a prior session's cold-stored nodes. |
 | `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand. |
 
 `Cli/Program.cs` is wiring + a console observer + the REPL.
@@ -58,8 +65,9 @@ Both implement the same `ISessionStore` seam.
 So it grows toward the full Ratchet without a rewrite. Each seam is where a
 doc'd feature plugs in:
 
-- **`ILlmClient`** → provider-agnostic later (OpenAI, Copilot-as-provider).
-- **`ITool`** → Roslyn semantic-navigation tool, MCP-backed tools, all land here.
+- **`ILlmClient`** → provider-agnostic later (OpenAI, Copilot-as-provider). Also
+  what the handover generator calls — summarising is just another completion.
+- **`ITool`** → Roslyn navigation, MCP-backed tools, and `recall` all land here.
 - **`IAgentObserver`** → audit logging / TUI / ACP streaming hang off this.
 - **`BashTool` + `ShellSpec`** → shell is swappable (bash/cmd/pwsh) today; the
   ConPTY upgrade replaces the `Process` plumbing inside this one class.
@@ -70,9 +78,10 @@ doc'd feature plugs in:
 
 ## What it deliberately does NOT do
 
-No context compaction, no sub-agents, no permission gates (YOLO bash, like pi).
-Each omission is a known next step, not an oversight. Add them one at a time —
-that's the curriculum.
+No **in-place context compaction**, no sub-agents, no permission gates (YOLO bash,
+like pi). The long-session answer here is handover (v0.5), not silent
+summarisation. Each omission is a known next step, not an oversight — add them one
+at a time; that's the curriculum.
 
 > **v0.1 — streaming.** Responses stream over SSE: assistant text appears
 > token-by-token, and tool-call arguments are reassembled from `input_json_delta`
@@ -92,7 +101,20 @@ that's the curriculum.
 > dependency-free) implements `ISessionStore` over one `.ratchet/ratchet.db`.
 > Nodes are append-only, so each turn inserts just the new rows instead of
 > rewriting a whole file; recursive CTEs walk the parent chain. Opt in with
-> `RATCHET_STORE=sqlite`. Next rungs: context compaction, a second `ILlmClient`.
+> `RATCHET_STORE=sqlite`.
+>
+> **v0.5 — handover (instead of compaction).** Long sessions are handled by
+> *retrieval-backed handover*, not in-place summarisation. `/handover` has the
+> model author a structured doc (goal · state · decisions · next steps · gotchas ·
+> pointers) saved as editable Markdown under `.ratchet/handovers/`. `ratchet
+> --handover <id>` then starts a **fresh** session with that doc injected as its
+> working set, plus a `recall` tool that searches the prior session's full tree
+> for detail the summary left out. Nothing is destroyed — old context is demoted
+> to cold storage, and loss is *authored*, not silent. The generator rides on
+> `ILlmClient`, `recall` rides on `ITool` + `ISessionStore`; the loop is untouched.
+> When unattended runs eventually need it, compaction returns as an auto-triggered
+> self-handover on the same machinery. Next rungs: a second `ILlmClient`; SQLite
+> FTS behind `recall`.
 
 ## Namespacing
 
