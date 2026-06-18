@@ -14,7 +14,7 @@ namespace CodeStack.Ratchet.Storage.Sqlite;
 /// rewrite, which is the win over the JSON-file store. Recursive CTEs walk the
 /// parent chain when you want the database to compute a path for you.
 /// </summary>
-public sealed class SqliteSessionStore : ISessionStore, IDisposable
+public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, IDisposable
 {
     private readonly SqliteConnection _conn;
 
@@ -42,6 +42,14 @@ public sealed class SqliteSessionStore : ISessionStore, IDisposable
                 PRIMARY KEY (session_id, id)
             );
             CREATE INDEX IF NOT EXISTS ix_nodes_parent ON nodes(session_id, parent_id);
+            """);
+
+        // Full-text index over the flattened transcript text, so `recall` can search
+        // in the database (the ITextSearchableStore seam) instead of loading the whole
+        // tree into memory. Standalone FTS5 table keyed by session + node.
+        Exec("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
+                USING fts5(session_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, body);
             """);
     }
 
@@ -77,6 +85,7 @@ public sealed class SqliteSessionStore : ISessionStore, IDisposable
         }
 
         using (var ins = _conn.CreateCommand())
+        using (var fts = _conn.CreateCommand())
         {
             ins.Transaction = tx;
             ins.CommandText = """
@@ -90,21 +99,153 @@ public sealed class SqliteSessionStore : ISessionStore, IDisposable
             var pRole = ins.Parameters.Add("$role", SqliteType.Text);
             var pEx = ins.Parameters.Add("$ex", SqliteType.Text);
 
+            fts.Transaction = tx;
+            fts.CommandText = "INSERT INTO nodes_fts (session_id, node_id, role, body) VALUES ($s, $id, $role, $body);";
+            var fS = fts.Parameters.Add("$s", SqliteType.Text);
+            var fId = fts.Parameters.Add("$id", SqliteType.Text);
+            var fRole = fts.Parameters.Add("$role", SqliteType.Text);
+            var fBody = fts.Parameters.Add("$body", SqliteType.Text);
+
             foreach (var node in tree.Nodes.Values)
             {
                 if (existing.Contains(node.Id)) continue;
+                var role = node.Message.Role == Role.User ? "user" : "assistant";
                 pS.Value = id;
                 pId.Value = node.Id;
                 pP.Value = (object?)node.ParentId ?? DBNull.Value;
                 pM.Value = MessageJson.Serialize(node.Message);
-                pRole.Value = node.Message.Role == Role.User ? "user" : "assistant";
+                pRole.Value = role;
                 pEx.Value = (object?)Excerpt(node.Message) ?? DBNull.Value;
                 ins.ExecuteNonQuery();
+
+                fS.Value = id;
+                fId.Value = node.Id;
+                fRole.Value = role;
+                fBody.Value = Flatten(node.Message);
+                fts.ExecuteNonQuery();
             }
         }
 
         tx.Commit();
         return id;
+    }
+
+    /// <summary>
+    /// Full-text search over a session's transcript via FTS5 — the database does the
+    /// matching and snippeting. The query is sent as a quoted phrase so arbitrary user
+    /// text can't trip FTS5's MATCH grammar; if MATCH still fails we fall back to LIKE.
+    /// </summary>
+    public IReadOnlyList<TextHit> SearchText(string sessionId, string query, int max)
+    {
+        BackfillFtsIfEmpty(sessionId);
+        max = Math.Clamp(max, 1, 50);
+        var hits = new List<TextHit>(max);
+
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT node_id, role, snippet(nodes_fts, 3, '', '', '…', 16)
+                FROM nodes_fts
+                WHERE session_id = $s AND nodes_fts MATCH $q
+                ORDER BY rank
+                LIMIT $max;
+                """;
+            cmd.Parameters.AddWithValue("$s", sessionId);
+            cmd.Parameters.AddWithValue("$q", '"' + query.Replace("\"", "\"\"") + '"');
+            cmd.Parameters.AddWithValue("$max", max);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                hits.Add(new TextHit(r.GetString(0), ParseRole(r.GetString(1)), Clean(r.GetString(2))));
+            return hits;
+        }
+        catch (SqliteException)
+        {
+            // Degrade to a LIKE scan if FTS rejected the query for any reason.
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT node_id, role, body FROM nodes_fts
+                WHERE session_id = $s AND body LIKE $like
+                LIMIT $max;
+                """;
+            cmd.Parameters.AddWithValue("$s", sessionId);
+            cmd.Parameters.AddWithValue("$like", "%" + query + "%");
+            cmd.Parameters.AddWithValue("$max", max);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                hits.Add(new TextHit(r.GetString(0), ParseRole(r.GetString(1)), Snippet(r.GetString(2), query)));
+            return hits;
+        }
+    }
+
+    /// <summary>Index older sessions (rows written before the FTS table existed) on first search.</summary>
+    private void BackfillFtsIfEmpty(string sessionId)
+    {
+        using (var chk = _conn.CreateCommand())
+        {
+            chk.CommandText = "SELECT EXISTS(SELECT 1 FROM nodes_fts WHERE session_id = $s);";
+            chk.Parameters.AddWithValue("$s", sessionId);
+            if (Convert.ToInt64(chk.ExecuteScalar()) != 0) return;
+        }
+
+        using var tx = _conn.BeginTransaction();
+        using (var sel = _conn.CreateCommand())
+        {
+            sel.Transaction = tx;
+            sel.CommandText = "SELECT id, message_json FROM nodes WHERE session_id = $s;";
+            sel.Parameters.AddWithValue("$s", sessionId);
+
+            using var ins = _conn.CreateCommand();
+            ins.Transaction = tx;
+            ins.CommandText = "INSERT INTO nodes_fts (session_id, node_id, role, body) VALUES ($s, $id, $role, $body);";
+            var fS = ins.Parameters.Add("$s", SqliteType.Text);
+            var fId = ins.Parameters.Add("$id", SqliteType.Text);
+            var fRole = ins.Parameters.Add("$role", SqliteType.Text);
+            var fBody = ins.Parameters.Add("$body", SqliteType.Text);
+
+            using var r = sel.ExecuteReader();
+            while (r.Read())
+            {
+                var msg = MessageJson.Deserialize(r.GetString(1));
+                fS.Value = sessionId;
+                fId.Value = r.GetString(0);
+                fRole.Value = msg.Role == CodeStack.Ratchet.Core.Role.User ? "user" : "assistant";
+                fBody.Value = Flatten(msg);
+                ins.ExecuteNonQuery();
+            }
+        }
+        tx.Commit();
+    }
+
+    private static Role ParseRole(string s) =>
+        s == "user" ? Role.User : Role.Assistant;
+
+    private static string Clean(string snippet) => snippet.ReplaceLineEndings(" ").Trim();
+
+    private static string Snippet(string body, string query)
+    {
+        var i = body.IndexOf(query, StringComparison.OrdinalIgnoreCase);
+        if (i < 0) return Clean(body.Length > 160 ? body[..160] : body);
+        var start = Math.Max(0, i - 60);
+        var len = Math.Min(body.Length - start, query.Length + 160);
+        return (start > 0 ? "…" : "") + Clean(body.Substring(start, len)) + (start + len < body.Length ? "…" : "");
+    }
+
+    /// <summary>Flatten a message to searchable text (the same shape RecallTool scans).</summary>
+    private static string Flatten(Message m)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var b in m.Content)
+        {
+            switch (b)
+            {
+                case TextBlock t: sb.Append(t.Text); break;
+                case ToolUseBlock u: sb.Append(u.Name).Append(' ').Append(u.InputJson); break;
+                case ToolResultBlock res: sb.Append(res.Content); break;
+            }
+            sb.Append('\n');
+        }
+        return sb.ToString();
     }
 
     public SessionTree? Load(string id)

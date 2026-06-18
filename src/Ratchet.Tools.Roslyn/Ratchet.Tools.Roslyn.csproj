@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodeStack.Ratchet.Tools.Roslyn</RootNamespace>
+    <AssemblyName>Ratchet.Tools.Roslyn</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Roslyn semantic C#. Separate project so Core stays dependency-free (the
+         Storage.Sqlite precedent). MSBuildWorkspace loads the user's real project. -->
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.7.8" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.12.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.12.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
+  </ItemGroup>
+
+</Project>

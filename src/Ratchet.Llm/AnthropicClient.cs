@@ -75,7 +75,20 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         w.WriteString("model", _model);
         w.WriteNumber("max_tokens", _maxTokens);
         w.WriteBoolean("stream", true);
-        w.WriteString("system", systemPrompt);
+
+        // Prompt caching: the system prompt and tool specs are stable across every
+        // turn, so cache them; and put a breakpoint at the end of the transcript so
+        // the conversation prefix is cached and re-read instead of re-billed each
+        // turn. The API ignores breakpoints under the cache minimum, so this is safe
+        // to always emit. See CacheControl.Write.
+        w.WritePropertyName("system");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteString("type", "text");
+        w.WriteString("text", systemPrompt);
+        CacheControl.Write(w);
+        w.WriteEndObject();
+        w.WriteEndArray();
 
         WriteTools(w, tools);
         WriteMessages(w, conversation);
@@ -88,15 +101,19 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
     private static void WriteTools(Utf8JsonWriter w, IReadOnlyCollection<ITool> tools)
     {
         w.WriteStartArray("tools");
+        var last = tools.Count - 1;
+        var i = 0;
         foreach (var tool in tools)
         {
             w.WriteStartObject();
             w.WriteString("name", tool.Name);
             w.WriteString("description", tool.Description);
             w.WritePropertyName("input_schema");
-            using var schema = JsonDocument.Parse(tool.InputSchemaJson);
-            schema.RootElement.WriteTo(w);
+            using (var schema = JsonDocument.Parse(tool.InputSchemaJson))
+                schema.RootElement.WriteTo(w);
+            if (i == last) CacheControl.Write(w);   // cache the whole tools prefix
             w.WriteEndObject();
+            i++;
         }
         w.WriteEndArray();
     }
@@ -104,20 +121,24 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
     private static void WriteMessages(Utf8JsonWriter w, Conversation conversation)
     {
         w.WriteStartArray("messages");
-        foreach (var msg in conversation.Messages)
+        var lastMsg = conversation.Messages.Count - 1;
+        for (var mi = 0; mi < conversation.Messages.Count; mi++)
         {
+            var msg = conversation.Messages[mi];
             w.WriteStartObject();
             w.WriteString("role", msg.Role == Role.User ? "user" : "assistant");
             w.WriteStartArray("content");
-            foreach (var block in msg.Content)
-                WriteContentBlock(w, block);
+            var lastBlock = msg.Content.Count - 1;
+            for (var bi = 0; bi < msg.Content.Count; bi++)
+                // A cache breakpoint on the final block caches the whole prefix up to here.
+                WriteContentBlock(w, msg.Content[bi], cache: mi == lastMsg && bi == lastBlock);
             w.WriteEndArray();
             w.WriteEndObject();
         }
         w.WriteEndArray();
     }
 
-    private static void WriteContentBlock(Utf8JsonWriter w, ContentBlock block)
+    private static void WriteContentBlock(Utf8JsonWriter w, ContentBlock block, bool cache = false)
     {
         switch (block)
         {
@@ -125,6 +146,7 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                 w.WriteStartObject();
                 w.WriteString("type", "text");
                 w.WriteString("text", t.Text);
+                if (cache) CacheControl.Write(w);
                 w.WriteEndObject();
                 break;
 
@@ -136,6 +158,7 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                 w.WritePropertyName("input");
                 using (var input = JsonDocument.Parse(u.InputJson))
                     input.RootElement.WriteTo(w);
+                if (cache) CacheControl.Write(w);
                 w.WriteEndObject();
                 break;
 
@@ -145,6 +168,7 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                 w.WriteString("tool_use_id", r.ToolUseId);
                 w.WriteString("content", r.Content);
                 if (r.IsError) w.WriteBoolean("is_error", true);
+                if (cache) CacheControl.Write(w);
                 w.WriteEndObject();
                 break;
         }

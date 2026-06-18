@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodeStack.Ratchet.Tools.Mcp</RootNamespace>
+    <AssemblyName>Ratchet.Tools.Mcp</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Model Context Protocol client. Kept in its own project so Core stays
+         dependency-free (the Storage.Sqlite precedent). -->
+    <PackageReference Include="ModelContextProtocol" Version="1.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -113,6 +113,22 @@ public interface ISessionStore
     IReadOnlyList<SessionInfo> List();
 }
 
+/// <summary>One full-text hit from a session's transcript: which node, and a snippet.</summary>
+public sealed record TextHit(string NodeId, Role Role, string Snippet);
+
+/// <summary>
+/// Optional capability a store can advertise: search a session's transcript text in
+/// the backend itself (e.g. SQLite FTS5) rather than loading the whole tree into
+/// memory and scanning. The <see cref="RecallTool"/> uses this when present and
+/// falls back to an in-memory scan when it isn't — so the seam is additive, no
+/// store is forced to implement it.
+/// </summary>
+public interface ITextSearchableStore
+{
+    /// <summary>Matches for <paramref name="query"/> in session <paramref name="sessionId"/>, best first.</summary>
+    IReadOnlyList<TextHit> SearchText(string sessionId, string query, int max);
+}
+
 /// <summary>
 /// One JSON file per session under {baseDir}/.ratchet/sessions/. Each message
 /// is stored in the same shape as the Messages API wire format, wrapped in a

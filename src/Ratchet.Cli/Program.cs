@@ -2,6 +2,30 @@ using System.Text;
 using CodeStack.Ratchet.Core;
 using CodeStack.Ratchet.Llm;
 using CodeStack.Ratchet.Storage.Sqlite;
+using CodeStack.Ratchet.Tools.Mcp;
+using CodeStack.Ratchet.Tools.Roslyn;
+
+// Register MSBuild before any Roslyn MSBuildWorkspace type loads (must be first).
+MsBuildBootstrap.Ensure();
+
+// Roslyn pipeline self-check (no API key needed): `ratchet --roslyn-check`.
+if (args.Contains("--roslyn-check"))
+{
+    using var rs = new RoslynToolset(Directory.GetCurrentDirectory());
+    foreach (var (tool, input) in new[]
+             {
+                 ("roslyn_diagnostics", "{}"),
+                 ("roslyn_find_symbol", "{\"name\":\"Agent\"}"),
+                 ("roslyn_find_references", "{\"name\":\"CompleteAsync\"}"),
+             })
+    {
+        Console.WriteLine($"── {tool} {input} ──");
+        var t = rs.Tools.First(x => x.Name == tool);
+        Console.WriteLine(await t.ExecuteAsync(input, CancellationToken.None));
+        Console.WriteLine();
+    }
+    return 0;
+}
 
 // ---- configuration --------------------------------------------------------
 // API key from env so it never lands in source. Model is overridable so you can
@@ -17,6 +41,11 @@ var model = Environment.GetEnvironmentVariable("RATCHET_MODEL") ?? "claude-sonne
 
 // Shell for the bash tool: bash | cmd | pwsh. Defaults per-OS when unset.
 var shell = ShellSpec.FromName(Environment.GetEnvironmentVariable("RATCHET_SHELL"));
+
+// Auto-compaction threshold: when a turn's input context exceeds this many tokens,
+// Ratchet authors a handover and starts fresh seeded with it (the self-triggered
+// version of /handover). 0 / unset disables it; /compact triggers it manually.
+int.TryParse(Environment.GetEnvironmentVariable("RATCHET_CONTEXT_LIMIT"), out var contextLimit);
 
 // ---- composition root -----------------------------------------------------
 // Storage backend: file (default) or sqlite. Both implement ISessionStore, so
@@ -50,17 +79,60 @@ if (hi >= 0 && hi + 1 < args.Length)
     Console.WriteLine($"resuming cold from handover of {h.SourceSessionId} ({h.CreatedUtc.ToLocalTime():yyyy-MM-dd HH:mm})");
 }
 
-// AGENTS.md (pi-style project context) and, when resuming, the handover doc are
-// both prepended to the system prompt — plain text, no magic.
-var systemPrompt = BuildSystemPrompt(handoverContext);
+// Agent Skills discovered under .ratchet/skills (+ .claude/skills, ~/.ratchet/skills):
+// names+descriptions go in the prompt; full bodies load on demand via load_skill.
+var skills = SkillCatalog.Discover(Directory.GetCurrentDirectory());
 
-var toolList = new List<ITool> { new ReadTool(), new WriteTool(), new EditTool(), new BashTool(shell) };
-if (recallTool is not null) toolList.Add(recallTool);
-var tools = new ToolRegistry(toolList);
+// AGENTS.md (pi-style project context), the skill list, and — when resuming — the handover
+// doc are all prepended to the system prompt. Plain text, no magic.
+var systemPrompt = BuildSystemPrompt(handoverContext, skills.Describe());
 
-using var llm = new AnthropicClient(apiKey, model);
+// Provider seam: every provider flows through IChatClient (ChatClientLlm), except the
+// original hand-rolled wire client kept as `anthropic-native` for wire-level transparency.
+//   unset / "anthropic"  -> Anthropic via IChatClient (AnthropicChatClient)
+//   "anthropic-native"   -> the original wire ILlmClient (no IChatClient)
+// Other IChatClient providers (OpenAI, Azure, Ollama) drop in here as one more case.
+// Built before the tool list because the sub-agents run nested loops over this same client.
+var provider = Environment.GetEnvironmentVariable("RATCHET_PROVIDER")?.ToLowerInvariant();
+ILlmClient llm = provider switch
+{
+    "anthropic-native" => new AnthropicClient(apiKey, model),
+    _ => new ChatClientLlm(new AnthropicChatClient(apiKey, model), model),
+};
+
+// Shared read-before-write guard (read/write mark a file "known"; edit requires it),
+// and the opt-in ConPTY shell (RATCHET_PTY=1) for a real TTY on Windows.
+var access = new FileAccessLog();
+var usePty = (Environment.GetEnvironmentVariable("RATCHET_PTY")?.Trim().ToLowerInvariant()) is "1" or "true" or "on";
+
+// Base tool set (everything except `recall`, which is added per-agent below so
+// auto-compaction can swap in a fresh one pointing at the just-archived session).
+var planTool = new PlanTool();
+var baseTools = new List<ITool>
+{
+    new ReadTool(access), new WriteTool(access), new EditTool(access), new BashTool(shell, usePty),
+    new SkillTool(skills), planTool,
+    new TestTool(shell, Environment.GetEnvironmentVariable("RATCHET_TEST_CMD")),
+};
+baseTools.AddRange(GitTools.Build(Directory.GetCurrentDirectory()));   // git_status / git_diff (read-only)
+baseTools.AddRange(SubAgents.Build(llm, shell));                       // explore sub-agent + advisors
+
+// Roslyn semantic-C# tools (loads the workspace's solution/project on first use).
+using var roslyn = new RoslynToolset(Directory.GetCurrentDirectory());
+baseTools.AddRange(roslyn.Tools);
+
+// MCP servers from .mcp.json: each server tool becomes a Ratchet ITool.
+await using var mcp = await McpToolset.ConnectAsync(Directory.GetCurrentDirectory(), Console.WriteLine, CancellationToken.None);
+baseTools.AddRange(mcp.Tools);
+
 var observer = new ConsoleObserver();
-var agent = new Agent(llm, tools, systemPrompt, observer);
+
+// The agent is rebuilt on compaction with a new system prompt + recall tool, so
+// construct it through a factory over the (mutable) systemPrompt and recallTool.
+Agent BuildAgent() =>
+    new(llm, new ToolRegistry(recallTool is null ? baseTools : baseTools.Append(recallTool)), systemPrompt, observer);
+
+var agent = BuildAgent();
 
 // Sessions are trees of message nodes (see SessionTree). The path root..HEAD is
 // the live conversation; rewinding HEAD and continuing forks a new branch.
@@ -80,7 +152,7 @@ if (handoverContext is null && args.Any(a => a is "--continue" or "-c"))
     }
 }
 
-Console.WriteLine($"ratchet v0  ·  model: {model}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
+Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider ?? "anthropic"}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
 Console.WriteLine(recallTool is not null
     ? "Resumed from a handover — `recall` is available to page back into the prior session.\n"
     : "Type a request, or /help for commands. Ctrl+C to quit.\n");
@@ -129,6 +201,11 @@ while (!cts.IsCancellationRequested)
             Console.WriteLine($"  · session {sessionId} (auto-saving)");
             Console.ResetColor();
         }
+
+        // Auto-compaction: once the context grows past the configured limit, fold it
+        // into a handover and continue in a fresh session seeded with that doc.
+        if (contextLimit > 0 && observer.LastInputTokens >= contextLimit && tree.Count > 0)
+            await CompactAsync();
     }
     catch (OperationCanceledException)
     {
@@ -144,6 +221,7 @@ while (!cts.IsCancellationRequested)
     Console.WriteLine();
 }
 
+(llm as IDisposable)?.Dispose();
 (store as IDisposable)?.Dispose();
 Console.WriteLine("bye.");
 return 0;
@@ -217,6 +295,11 @@ async Task HandleCommandAsync(string input)
             foreach (var id in hs) Console.WriteLine($"  {id}   →   ratchet --handover {id}");
             break;
 
+        case "/compact":
+            if (tree.Count == 0) { Console.WriteLine("  nothing to compact yet"); break; }
+            await CompactAsync();
+            break;
+
         case "/help":
             Console.WriteLine("  /sessions       list saved sessions");
             Console.WriteLine("  /resume <id>    load a session and continue");
@@ -226,6 +309,7 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine("  /goto <node>    jump HEAD to a node (e.g. another branch tip)");
             Console.WriteLine("  /handover       write a handover doc for resuming cold later");
             Console.WriteLine("  /handovers      list handovers (with their resume commands)");
+            Console.WriteLine("  /compact        fold this session into a handover and continue fresh");
             Console.WriteLine("  Ctrl+C          quit");
             break;
 
@@ -233,6 +317,32 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine($"  unknown command '{parts[0]}' — try /help");
             break;
     }
+}
+
+// Compaction = self-triggered handover. Persist the current session (so its tree is
+// a cold store), author a handover from it, then continue in a FRESH session whose
+// system prompt carries that handover and whose `recall` searches the archived one —
+// the same machinery as `ratchet --handover`, applied in-process.
+async Task CompactAsync()
+{
+    var priorId = store.Save(sessionId, tree);
+    Console.ForegroundColor = ConsoleColor.DarkCyan;
+    Console.WriteLine($"\n  · context ~{observer.LastInputTokens} input tokens — compacting into a handover…\n");
+    string doc;
+    try { doc = await new HandoverGenerator(llm).GenerateAsync(tree.MaterializeConversation(), Console.Write, cts.Token); }
+    finally { Console.ResetColor(); }
+    handovers.Save(new Handover(priorId, tree.HeadId, DateTime.UtcNow, doc));
+
+    // Reseed: fresh tree, handover-backed prompt, recall wired to the archived session.
+    systemPrompt = BuildSystemPrompt(doc, skills.Describe());
+    recallTool = new RecallTool(store, priorId);
+    agent = BuildAgent();
+    tree = new SessionTree();
+    sessionId = null;
+
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine($"\n  · compacted → handover of {priorId}. Continuing fresh; `recall` searches {priorId}.");
+    Console.ResetColor();
 }
 
 // Walk the tree depth-first from the roots, indenting by depth, marking HEAD.
@@ -274,18 +384,28 @@ static string Trunc(string s)
     return s.Length > 50 ? s[..50] + "…" : s;
 }
 
-static string BuildSystemPrompt(string? handover)
+static string BuildSystemPrompt(string? handover, string skillList)
 {
     const string baseline =
-        "You are Ratchet, a minimal coding agent running on the user's machine. " +
-        "You have four tools: read, write, edit, bash. Prefer reading files before " +
-        "editing them. Keep going until the task is done, then stop and report briefly.";
+        "You are Ratchet, a coding agent running on the user's machine. " +
+        "Core tools: read, write, edit, bash. Always read a file before you edit it — the edit tool " +
+        "requires it and the match must be unique (use replace_all for sweeping changes). " +
+        "Use `update_plan` to keep an explicit checklist for any multi-step task. " +
+        "Use `run_tests` to run and check the suite, and `git_status` / `git_diff` to see what you've changed. " +
+        "You can also delegate: call `explore` to hand a read-only investigation to a sub-agent " +
+        "(it returns findings without filling your context), and the *_advisor tools to consult a " +
+        "specialist for a second opinion (paste the relevant code into your question). " +
+        "Keep going until the task is done, then stop and report briefly.";
 
     var sb = new StringBuilder(baseline);
 
     var agentsMd = Path.Combine(Directory.GetCurrentDirectory(), "AGENTS.md");
     if (File.Exists(agentsMd))
         sb.Append("\n\n# Project context (AGENTS.md)\n").Append(File.ReadAllText(agentsMd));
+
+    if (!string.IsNullOrWhiteSpace(skillList))
+        sb.Append("\n\n# Skills available (call load_skill <name> for full instructions before the matching task)\n")
+          .Append(skillList);
 
     if (!string.IsNullOrWhiteSpace(handover))
         sb.Append("\n\n# Resumed session — handover from a prior session\n")
@@ -304,6 +424,9 @@ static string BuildSystemPrompt(string? handover)
 /// </summary>
 sealed class ConsoleObserver : IAgentObserver
 {
+    /// <summary>Input tokens of the most recent model call — the auto-compaction signal.</summary>
+    public int LastInputTokens { get; private set; }
+
     public void OnAssistantTextDelta(string delta)
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -334,6 +457,7 @@ sealed class ConsoleObserver : IAgentObserver
 
     public void OnUsage(int inputTokens, int outputTokens)
     {
+        LastInputTokens = inputTokens;
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine($"  · tokens: {inputTokens} in / {outputTokens} out");
         Console.ResetColor();

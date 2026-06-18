@@ -47,6 +47,17 @@ public sealed class RecallTool : ITool
             if (doc.RootElement.TryGetProperty("max", out var m) && m.TryGetInt32(out var v))
                 max = Math.Clamp(v, 1, 20);
 
+        // If the store can search in the backend (SQLite FTS), let it — no need to
+        // pull the whole tree into memory. Otherwise fall back to the in-memory scan.
+        if (_store is ITextSearchableStore searchable)
+        {
+            var found = searchable.SearchText(_sourceSessionId, query, max);
+            return Task.FromResult(found.Count == 0
+                ? $"No matches for '{query}' in session {_sourceSessionId}."
+                : string.Join("\n\n", found.Select(h =>
+                    $"[node {h.NodeId} · {(h.Role == Role.User ? "user" : "asst")}] {h.Snippet}")));
+        }
+
         var tree = _cached ??= _store.Load(_sourceSessionId);
         if (tree is null)
             return Task.FromResult($"No prior session '{_sourceSessionId}' to recall from.");

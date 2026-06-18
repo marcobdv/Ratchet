@@ -9,6 +9,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Adopt the Microsoft.Extensions.AI IChatClient abstraction so any provider
+         (and MCP tools, which are AITools) plugs into the same ILlmClient seam.
+         Only this provider project references it; Core stays dependency-free. -->
+    <PackageReference Include="Microsoft.Extensions.AI" Version="10.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
   </ItemGroup>
 
