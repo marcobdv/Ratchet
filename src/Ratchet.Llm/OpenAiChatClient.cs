@@ -25,9 +25,11 @@ public sealed class OpenAiChatClient : IChatClient
     private readonly string _model;
     private readonly int _maxTokens;
 
-    /// <param name="baseUrl">e.g. http://localhost:11434/v1 (Ollama) or https://api.openai.com/v1.</param>
+    /// <param name="baseUrl">e.g. http://localhost:11434/v1 (Ollama), https://openrouter.ai/api/v1, https://api.openai.com/v1.</param>
     /// <param name="apiKey">Bearer token; many local servers ignore it (pass anything).</param>
-    public OpenAiChatClient(string baseUrl, string model, string? apiKey = null, int maxTokens = 4096)
+    /// <param name="extraHeaders">Extra request headers — e.g. OpenRouter's HTTP-Referer / X-Title attribution.</param>
+    public OpenAiChatClient(string baseUrl, string model, string? apiKey = null, int maxTokens = 4096,
+        IReadOnlyDictionary<string, string>? extraHeaders = null)
     {
         _model = model;
         _maxTokens = maxTokens;
@@ -35,6 +37,9 @@ public sealed class OpenAiChatClient : IChatClient
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
         if (!string.IsNullOrWhiteSpace(apiKey))
             _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        if (extraHeaders is not null)
+            foreach (var (k, v) in extraHeaders)
+                if (!string.IsNullOrWhiteSpace(v)) _http.DefaultRequestHeaders.Add(k, v);
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(

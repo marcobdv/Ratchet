@@ -28,17 +28,41 @@ if (args.Contains("--roslyn-check"))
     return 0;
 }
 
-// ---- configuration --------------------------------------------------------
-// API key from env so it never lands in source. Model is overridable so you can
-// swap it without recompiling when a new one ships.
-var apiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY");
-if (string.IsNullOrWhiteSpace(apiKey))
+// Inspect persisted workflow runs (read-only; no API key needed).
+if (args.Contains("--runs"))
 {
-    Console.Error.WriteLine("Set ANTHROPIC_API_KEY first:  setx ANTHROPIC_API_KEY \"sk-ant-...\"");
-    return 1;
+    var runs = new FileRunStore(Directory.GetCurrentDirectory()).List();
+    if (runs.Count == 0) { Console.WriteLine("(no workflow runs yet)"); return 0; }
+    foreach (var r in runs)
+        Console.WriteLine($"  {r.RunId}  ·  {r.Status,-9}  ·  {r.WorkType ?? "-",-12}  ·  {r.Task}");
+    return 0;
+}
+var runShowIdx = Array.IndexOf(args, "--run");
+if (runShowIdx >= 0 && runShowIdx + 1 < args.Length)
+{
+    var snap = new FileRunStore(Directory.GetCurrentDirectory()).Load(args[runShowIdx + 1]);
+    if (snap is null) { Console.Error.WriteLine($"no run '{args[runShowIdx + 1]}'"); return 1; }
+    Console.WriteLine($"run {snap.RunId}  ·  {snap.Status}  ·  work_type={snap.WorkType}  ·  task: {snap.Task}");
+    if (!string.IsNullOrWhiteSpace(snap.ClassifierReasoning)) Console.WriteLine($"  reasoning: {snap.ClassifierReasoning}");
+    foreach (var e in snap.Events) Console.WriteLine($"  [{e.Kind}] {e.Phase}: {e.Detail}");
+    Console.WriteLine("  " + snap.Cost.Render().Replace("\n", "\n  "));
+    if (snap.IsResumable) Console.WriteLine($"  (resumable: ratchet --workflow-resume {snap.RunId})");
+    return 0;
 }
 
-var model = Environment.GetEnvironmentVariable("RATCHET_MODEL") ?? "claude-sonnet-4-6";
+// ---- configuration --------------------------------------------------------
+// Provider-agnostic: RATCHET_PROVIDER picks the backend (default anthropic), RATCHET_MODEL
+// the model. Keys come from each provider's env var — see ResolveClient. Not tied to one
+// vendor: OpenRouter (one key, hundreds of models), OpenAI, Groq, any OpenAI-compatible
+// endpoint, or a local server all drop in here.
+var provider = (Environment.GetEnvironmentVariable("RATCHET_PROVIDER") ?? "anthropic").Trim().ToLowerInvariant();
+var model = Environment.GetEnvironmentVariable("RATCHET_MODEL") ?? DefaultModelFor(provider) ?? "";
+if (string.IsNullOrWhiteSpace(model))
+{
+    Console.Error.WriteLine($"Provider '{provider}' needs a model id: set RATCHET_MODEL " +
+        "(e.g. openrouter → anthropic/claude-sonnet-4 or openai/gpt-4o; groq → llama-3.3-70b-versatile).");
+    return 1;
+}
 
 // Shell for the bash tool: bash | cmd | pwsh. Defaults per-OS when unset.
 var shell = ShellSpec.FromName(Environment.GetEnvironmentVariable("RATCHET_SHELL"));
@@ -88,18 +112,14 @@ var skills = SkillCatalog.Discover(Directory.GetCurrentDirectory());
 // doc are all prepended to the system prompt. Plain text, no magic.
 var systemPrompt = BuildSystemPrompt(handoverContext, skills.Describe());
 
-// Provider seam: every provider flows through IChatClient (ChatClientLlm), except the
-// original hand-rolled wire client kept as `anthropic-native` for wire-level transparency.
-//   unset / "anthropic"  -> Anthropic via IChatClient (AnthropicChatClient)
-//   "anthropic-native"   -> the original wire ILlmClient (no IChatClient)
-// Other IChatClient providers (OpenAI, Azure, Ollama) drop in here as one more case.
-// Built before the tool list because the sub-agents run nested loops over this same client.
-var provider = Environment.GetEnvironmentVariable("RATCHET_PROVIDER")?.ToLowerInvariant();
-ILlmClient llm = provider switch
-{
-    "anthropic-native" => new AnthropicClient(apiKey, model),
-    _ => new ChatClientLlm(new AnthropicChatClient(apiKey, model), model),
-};
+// Provider seam: every provider flows through ILlmClient. Anthropic rides IChatClient
+// (AnthropicChatClient) or the hand-rolled wire client (`anthropic-native`); every other
+// backend is OpenAI-compatible and flows through OpenAiChatClient. ResolveClient maps the
+// provider name to a client and resolves its key/base URL from env. Built before the tool
+// list because the sub-agents run nested loops over this same client.
+ILlmClient llm;
+try { llm = ResolveClient(provider, model); }
+catch (Exception ex) { Console.Error.WriteLine(ex.Message); (store as IDisposable)?.Dispose(); return 1; }
 
 // Shared read-before-write guard (read/write mark a file "known"; edit requires it),
 // and the opt-in ConPTY shell (RATCHET_PTY=1) for a real TTY on Windows.
@@ -115,8 +135,9 @@ var baseTools = new List<ITool>
     new SkillTool(skills), planTool,
     new TestTool(shell, Environment.GetEnvironmentVariable("RATCHET_TEST_CMD")),
 };
-baseTools.AddRange(GitTools.Build(Directory.GetCurrentDirectory()));   // git_status / git_diff (read-only)
-baseTools.AddRange(SubAgents.Build(llm, shell));                       // explore sub-agent + advisors
+baseTools.AddRange(GitTools.Build(Directory.GetCurrentDirectory()));        // git_status / git_diff (read-only)
+baseTools.AddRange(GitTools.BuildWrite(Directory.GetCurrentDirectory()));   // git_commit / git_create_branch (mutating → gated)
+baseTools.AddRange(SubAgents.Build(llm, shell));                            // explore sub-agent + advisors
 
 // Roslyn semantic-C# tools (loads the workspace's solution/project on first use).
 using var roslyn = new RoslynToolset(Directory.GetCurrentDirectory());
@@ -128,32 +149,23 @@ baseTools.AddRange(mcp.Tools);
 
 var observer = new ConsoleObserver();
 
+// Permission gate. RATCHET_GATE = off (default, historical YOLO) | prompt (ask before
+// mutating tools: bash/write/edit/git_commit/git_create_branch/roslyn_rename) | deny
+// (block them). Read-only tools always pass. Used by both the REPL agent and workflows.
+var gate = new ConsoleToolGate(Environment.GetEnvironmentVariable("RATCHET_GATE"));
+
 // `ratchet --workflow <file.yaml> "<task>"` runs the task through a phased workflow
 // orchestrator (research→plan→implement→verify→review) instead of the single REPL
 // loop. The scheduler is deterministic; LLM judgment shows up only at the intake
 // classifier and judge gates. See docs/workflow-orchestration.md.
 var wfIdx = Array.IndexOf(args, "--workflow");
-if (wfIdx >= 0 && wfIdx + 1 < args.Length)
+var wfResumeIdx = Array.IndexOf(args, "--workflow-resume");
+if ((wfIdx >= 0 && wfIdx + 1 < args.Length) || (wfResumeIdx >= 0 && wfResumeIdx + 1 < args.Length))
 {
-    var wfFile = args[wfIdx + 1];
-    var wfTask = string.Join(' ', args.Skip(wfIdx + 2));
-    if (string.IsNullOrWhiteSpace(wfTask))
-    {
-        Console.Write("workflow task> ");
-        wfTask = Console.ReadLine() ?? "";
-    }
-    if (string.IsNullOrWhiteSpace(wfTask)) { Console.Error.WriteLine("no task given"); return 1; }
-
-    // Tier -> ILlmClient. 'anthropic' uses the hosted API; 'local'/'openai' point at any
-    // OpenAI-compatible endpoint (Ollama/LM Studio/vLLM) via RATCHET_LOCAL_BASE_URL.
-    var localBase = Environment.GetEnvironmentVariable("RATCHET_LOCAL_BASE_URL") ?? "http://localhost:11434/v1";
-    var localKey = Environment.GetEnvironmentVariable("RATCHET_LOCAL_API_KEY");
-    Func<ModelTier, ILlmClient> clientFactory = tier => tier.Provider.ToLowerInvariant() switch
-    {
-        "anthropic" => new ChatClientLlm(new AnthropicChatClient(apiKey, tier.Model), tier.Model),
-        "local" or "openai" => new ChatClientLlm(new OpenAiChatClient(localBase, tier.Model, localKey), tier.Model),
-        _ => throw new InvalidOperationException($"workflow: unknown provider '{tier.Provider}' for tier '{tier.Name}'."),
-    };
+    // Tier -> ILlmClient via the same provider resolver as the REPL: a tier can be
+    // anthropic, openrouter, openai, groq, local, or any OpenAI-compatible endpoint, so
+    // a workflow can mix (e.g. a local cheap driver with an OpenRouter frontier judge).
+    Func<ModelTier, ILlmClient> clientFactory = tier => ResolveClient(tier.Provider.Trim().ToLowerInvariant(), tier.Model);
 
     // Base tools resolve by name from the already-assembled set (read/write/edit/bash/
     // load_skill/run_tests/git_*/roslyn_*/…). consult_advisor, recall and request_escalation
@@ -162,21 +174,55 @@ if (wfIdx >= 0 && wfIdx + 1 < args.Length)
     foreach (var t in baseTools) toolByName[t.Name] = t;
     BaseToolResolver resolveTool = n => toolByName.GetValueOrDefault(n);
 
+    var runStore = new FileRunStore(Directory.GetCurrentDirectory());
     var knownSkills = skills.Skills.Select(s => s.Name).ToList();
+
+    // --workflow-resume <id> continues an interrupted run from its last checkpoint
+    // (same config, same sizing); --workflow <file> "<task>" starts a fresh run.
+    RunSnapshot? resume = null;
+    string wfFile, wfTask, runId;
+    if (wfResumeIdx >= 0 && wfResumeIdx + 1 < args.Length)
+    {
+        var resumeId = args[wfResumeIdx + 1];
+        resume = runStore.Load(resumeId);
+        if (resume is null) { Console.Error.WriteLine($"no run '{resumeId}'"); return 1; }
+        if (!resume.IsResumable) { Console.Error.WriteLine($"run '{resumeId}' is {resume.Status}, not resumable"); return 1; }
+        wfFile = resume.WorkflowFile; wfTask = resume.Task; runId = resume.RunId;
+        Console.WriteLine($"resuming run {runId} (work_type {resume.WorkType}) from phase index {resume.Idx}\n");
+    }
+    else
+    {
+        wfFile = args[wfIdx + 1];
+        wfTask = string.Join(' ', args.Skip(wfIdx + 2));
+        if (string.IsNullOrWhiteSpace(wfTask)) { Console.Write("workflow task> "); wfTask = Console.ReadLine() ?? ""; }
+        if (string.IsNullOrWhiteSpace(wfTask)) { Console.Error.WriteLine("no task given"); return 1; }
+        runId = "wf-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+    }
+
     WorkflowConfig wf;
     try { wf = WorkflowLoader.Load(wfFile, knownSkills); }
     catch (WorkflowConfigException ex) { Console.Error.WriteLine(ex.Message); return 1; }
+    catch (Exception ex) { Console.Error.WriteLine($"could not load workflow '{wfFile}': {ex.Message}"); return 1; }
 
-    var runId = "wf-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
-    Console.WriteLine($"workflow '{wf.Name}'  ·  run {runId}  ·  task: {wfTask}\n");
+    Console.WriteLine($"workflow '{wf.Name}'  ·  run {runId}  ·  gate {gate.ModeName}  ·  task: {wfTask}\n");
 
     var scheduler = new WorkflowScheduler(
         wf, clientFactory, resolveTool, store, shell, runId,
-        skills, observer, new ConsoleWorkflowObserver());
+        skills, observer, new ConsoleWorkflowObserver(), gate, runStore, wfFile);
 
     WorkflowRun result;
-    try { result = await scheduler.RunAsync(wfTask, CancellationToken.None); }
-    catch (Exception ex) { Console.Error.WriteLine($"[workflow error] {ex.Message}"); return 1; }
+    try { result = await scheduler.RunAsync(wfTask, CancellationToken.None, resume); }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[workflow error] {ex.Message}");
+        Console.Error.WriteLine($"  run {runId} checkpointed — resume with:  ratchet --workflow-resume {runId}");
+        return 1;
+    }
+
+    Console.ForegroundColor = ConsoleColor.DarkGray;
+    Console.WriteLine("\n" + result.Cost.Render());
+    Console.WriteLine($"run record: .ratchet/runs/{runId}.json  ·  inspect with: ratchet --run {runId}");
+    Console.ResetColor();
 
     (llm as IDisposable)?.Dispose();
     (store as IDisposable)?.Dispose();
@@ -186,7 +232,7 @@ if (wfIdx >= 0 && wfIdx + 1 < args.Length)
 // The agent is rebuilt on compaction with a new system prompt + recall tool, so
 // construct it through a factory over the (mutable) systemPrompt and recallTool.
 Agent BuildAgent() =>
-    new(llm, new ToolRegistry(recallTool is null ? baseTools : baseTools.Append(recallTool)), systemPrompt, observer);
+    new(llm, new ToolRegistry(recallTool is null ? baseTools : baseTools.Append(recallTool)), systemPrompt, observer, gate);
 
 var agent = BuildAgent();
 
@@ -208,7 +254,7 @@ if (handoverContext is null && args.Any(a => a is "--continue" or "-c"))
     }
 }
 
-Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider ?? "anthropic"}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
+Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider}  ·  gate: {gate.ModeName}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
 Console.WriteLine(recallTool is not null
     ? "Resumed from a handover — `recall` is available to page back into the prior session.\n"
     : "Type a request, or /help for commands. Ctrl+C to quit.\n");
@@ -440,6 +486,73 @@ static string Trunc(string s)
     return s.Length > 50 ? s[..50] + "…" : s;
 }
 
+// Default model only for Anthropic (its slug is stable here); every other provider must
+// name its model because slugs differ per backend (openrouter "vendor/model", etc.).
+static string? DefaultModelFor(string provider) => provider switch
+{
+    "anthropic" or "anthropic-native" => "claude-sonnet-4-6",
+    _ => null,
+};
+
+// Maps a provider name + model to an ILlmClient, resolving key/base URL from env. This
+// is the one place that knows provider specifics; everything else just holds an ILlmClient.
+//   anthropic / anthropic-native  -> ANTHROPIC_API_KEY
+//   openrouter                    -> OPENROUTER_API_KEY | RATCHET_API_KEY   (base openrouter.ai/api/v1)
+//   openai                        -> OPENAI_API_KEY     | RATCHET_API_KEY
+//   groq                          -> GROQ_API_KEY       | RATCHET_API_KEY
+//   local / ollama                -> RATCHET_LOCAL_API_KEY (optional), RATCHET_LOCAL_BASE_URL
+//   generic / unknown + RATCHET_BASE_URL -> RATCHET_API_KEY
+// RATCHET_BASE_URL overrides the base URL for any OpenAI-compatible provider (proxies, etc.).
+static ILlmClient ResolveClient(string provider, string model)
+{
+    static string? Env(string n) => Environment.GetEnvironmentVariable(n);
+    static string? FirstEnv(params string[] names) =>
+        names.Select(Env).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+    static string RequireKey(string who, params string[] names)
+    {
+        var k = FirstEnv(names);
+        if (string.IsNullOrWhiteSpace(k))
+            throw new InvalidOperationException($"{who}: set {string.Join(" or ", names)}.");
+        return k!;
+    }
+    static ILlmClient OpenAi(string defaultBase, string model, string? key, IReadOnlyDictionary<string, string>? headers = null) =>
+        new ChatClientLlm(new OpenAiChatClient(Env("RATCHET_BASE_URL") ?? defaultBase, model, key, extraHeaders: headers), model);
+
+    switch (provider)
+    {
+        case "anthropic":
+            return new ChatClientLlm(new AnthropicChatClient(RequireKey("Anthropic provider", "ANTHROPIC_API_KEY"), model), model);
+        case "anthropic-native":
+            return new AnthropicClient(RequireKey("Anthropic provider", "ANTHROPIC_API_KEY"), model);
+
+        case "openrouter":
+            return OpenAi("https://openrouter.ai/api/v1", model,
+                RequireKey("OpenRouter provider", "OPENROUTER_API_KEY", "RATCHET_API_KEY"),
+                new Dictionary<string, string>
+                {
+                    ["HTTP-Referer"] = Env("RATCHET_OPENROUTER_REFERER") ?? "https://github.com/marcobdv/Ratchet",
+                    ["X-Title"] = Env("RATCHET_OPENROUTER_TITLE") ?? "Ratchet",
+                });
+        case "openai":
+            return OpenAi("https://api.openai.com/v1", model, RequireKey("OpenAI provider", "OPENAI_API_KEY", "RATCHET_API_KEY"));
+        case "groq":
+            return OpenAi("https://api.groq.com/openai/v1", model, RequireKey("Groq provider", "GROQ_API_KEY", "RATCHET_API_KEY"));
+        case "local":
+        case "ollama":
+            return OpenAi(Env("RATCHET_LOCAL_BASE_URL") ?? "http://localhost:11434/v1", model, Env("RATCHET_LOCAL_API_KEY"));
+
+        default:
+            // "generic", "openai-compatible", or any unknown name: treat as an OpenAI-compatible
+            // endpoint if a base URL is provided; otherwise fail with guidance.
+            var baseUrl = Env("RATCHET_BASE_URL");
+            if (!string.IsNullOrWhiteSpace(baseUrl))
+                return new ChatClientLlm(new OpenAiChatClient(baseUrl!, model, FirstEnv("RATCHET_API_KEY")), model);
+            throw new InvalidOperationException(
+                $"unknown provider '{provider}'. Use anthropic | anthropic-native | openrouter | openai | groq | local " +
+                "| any OpenAI-compatible endpoint via RATCHET_BASE_URL (+ RATCHET_API_KEY).");
+    }
+}
+
 static string BuildSystemPrompt(string? handover, string skillList)
 {
     const string baseline =
@@ -563,5 +676,52 @@ sealed class ConsoleWorkflowObserver : IWorkflowObserver
     {
         s = s.ReplaceLineEndings(" ").Trim();
         return s.Length > 160 ? s[..160] + "…" : s;
+    }
+}
+
+/// <summary>
+/// The interactive permission gate. Read-only tools always pass; mutating ones
+/// (bash/write/edit/git_commit/git_create_branch/roslyn_rename) are governed by the
+/// mode: <c>off</c> allows everything (pi-plain YOLO, the default), <c>prompt</c> asks
+/// the user (with an "always allow this tool" option), <c>deny</c> blocks them. In a
+/// non-interactive process, <c>prompt</c> degrades to deny rather than hang.
+/// </summary>
+sealed class ConsoleToolGate : IToolGate
+{
+    private enum Mode { Off, Prompt, Deny }
+    private readonly Mode _mode;
+    private static readonly HashSet<string> Mutating = new(StringComparer.Ordinal)
+    { "bash", "write", "edit", "git_commit", "git_create_branch", "roslyn_rename" };
+    private readonly HashSet<string> _alwaysAllow = new(StringComparer.Ordinal);
+
+    public ConsoleToolGate(string? mode) => _mode = (mode?.Trim().ToLowerInvariant()) switch
+    {
+        "prompt" or "ask" => Mode.Prompt,
+        "deny" => Mode.Deny,
+        _ => Mode.Off,
+    };
+
+    public string ModeName => _mode.ToString().ToLowerInvariant();
+
+    public Task<ToolGateDecision> CheckAsync(string toolName, string inputJson, CancellationToken ct)
+    {
+        if (_mode == Mode.Off || !Mutating.Contains(toolName) || _alwaysAllow.Contains(toolName))
+            return Task.FromResult(ToolGateDecision.Allow);
+        if (_mode == Mode.Deny)
+            return Task.FromResult(ToolGateDecision.Deny("permission gate is in deny mode"));
+
+        // prompt mode
+        if (Console.IsInputRedirected)
+            return Task.FromResult(ToolGateDecision.Deny("approval required but input is non-interactive (set RATCHET_GATE=off to allow)"));
+
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        var preview = inputJson.Length > 160 ? inputJson[..160] + "…" : inputJson;
+        Console.Write($"\n[gate] allow  {toolName} {preview}  ? [y/N/a=always] ");
+        Console.ResetColor();
+        var ans = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+        if (ans == "a") { _alwaysAllow.Add(toolName); return Task.FromResult(ToolGateDecision.Allow); }
+        return Task.FromResult(ans is "y" or "yes"
+            ? ToolGateDecision.Allow
+            : ToolGateDecision.Deny("the user declined this action"));
     }
 }

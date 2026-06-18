@@ -22,8 +22,9 @@ models:
   driver_cheap:     { provider: anthropic, model: claude-haiku-4-5-20251001 }
   driver_mid:       { provider: anthropic, model: claude-sonnet-4-6 }
   advisor_frontier: { provider: anthropic, model: claude-opus-4-8 }
-  # Example local tier (Ollama / LM Studio / vLLM); swap driver_cheap to this:
-  # driver_local:   { provider: local,     model: qwen2.5-coder:14b }
+  # Mix backends freely — provider can be anthropic | openrouter | openai | groq | local.
+  # driver_local:   { provider: local,      model: qwen2.5-coder:14b }   # Ollama (RATCHET_LOCAL_BASE_URL)
+  # judge_or:       { provider: openrouter, model: anthropic/claude-sonnet-4 }  # OPENROUTER_API_KEY
 
 defaults:
   driver: driver_cheap
@@ -81,6 +82,14 @@ spine:
     tools: [read, recall, git_diff]
     gate: { type: judge, agent: code-review, fresh_context: true, model: advisor_frontier, on_fail: loop, max_loops: 2 }
 
+  - id: land
+    skippable: true             # the terminal "land" step — branch + commit the change
+    role: "Create a branch and commit the reviewed change with a clear, conventional message."
+    driver: driver_cheap
+    advisor: null
+    tools: [git_status, git_diff, git_create_branch, git_commit]
+    gate: { type: none }        # git_commit is mutating, so the permission gate governs it
+
 # The classifier selects one overlay. Each MUST include the floors (verify, review).
 # Skills are empty here so this file loads on a repo with no skills registered; add
 # them per (phase, work_type) as `phase: [skill-name, ...]` once skills exist.
@@ -91,11 +100,11 @@ work_types:
     skills: {}
 
   small_change:
-    phases: [plan, implement, verify, review]
+    phases: [plan, implement, verify, review, land]
     skills: {}
 
   feature:
-    phases: [research, plan, implement, verify, review]
+    phases: [research, plan, implement, verify, review, land]
     skills: {}
 
   bugfix:

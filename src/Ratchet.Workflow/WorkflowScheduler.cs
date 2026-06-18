@@ -30,9 +30,13 @@ public sealed class WorkflowScheduler
     private readonly SkillCatalog? _skills;
     private readonly IAgentObserver _agentObserver;
     private readonly IWorkflowObserver? _echo;
+    private readonly IToolGate _gate;
+    private readonly IRunStore? _runStore;
+    private readonly string? _workflowFile;
     private readonly string _runId;
 
     private readonly Dictionary<string, ILlmClient> _clients = new(StringComparer.Ordinal);
+    private CostTally _tally = new();   // set per run; metered clients write here
 
     private const int EscalationBudget = 4;   // global ceiling on "this was bigger than sized" jumps
 
@@ -45,7 +49,10 @@ public sealed class WorkflowScheduler
         string runId,
         SkillCatalog? skills = null,
         IAgentObserver? agentObserver = null,
-        IWorkflowObserver? echo = null)
+        IWorkflowObserver? echo = null,
+        IToolGate? gate = null,
+        IRunStore? runStore = null,
+        string? workflowFile = null)
     {
         _config = config;
         _clientFactory = clientFactory;
@@ -56,40 +63,94 @@ public sealed class WorkflowScheduler
         _skills = skills;
         _agentObserver = agentObserver ?? NullObserver.Instance;
         _echo = echo;
+        _gate = gate ?? AllowAllGate.Instance;
+        _runStore = runStore;
+        _workflowFile = workflowFile;
     }
 
+    // Every completion for a tier is metered into _tally, so per-tier cost falls out
+    // automatically across drivers, classifier, judges, advisors, and handovers.
     private ILlmClient Client(string tierName)
     {
         if (!_clients.TryGetValue(tierName, out var c))
-            _clients[tierName] = c = _clientFactory(_config.Models[tierName]);
+            _clients[tierName] = c = new MeteredLlmClient(_clientFactory(_config.Models[tierName]), tierName, _tally);
         return c;
     }
 
-    public async Task<WorkflowRun> RunAsync(string task, CancellationToken ct)
+    public Task<WorkflowRun> RunAsync(string task, CancellationToken ct) => RunAsync(task, ct, null);
+
+    /// <summary>
+    /// Run (or resume) the workflow. With <paramref name="resume"/> the loop state is
+    /// rehydrated from a snapshot and continues from the last checkpointed phase — the
+    /// classifier does not re-run, so the original sizing is preserved. Without it, a
+    /// fresh run classifies first. A checkpoint is written before each phase, so an
+    /// interrupted run (e.g. a transient API error) resumes by re-running only that phase.
+    /// </summary>
+    public async Task<WorkflowRun> RunAsync(string task, CancellationToken ct, RunSnapshot? resume)
     {
+        _clients.Clear();
         var run = new WorkflowRun(_runId, task, _echo);
+        if (resume is not null)
+            run.SeedFrom(resume.WorkType, resume.ClassifierReasoning, resume.Events, resume.Cost);
+        _tally = run.Cost;   // metered clients accumulate onto the (possibly seeded) total
 
-        // 1. Intake classifier — one judgment, recorded. Use the advisor tier if there
-        //    is one (this is the highest-leverage call), else the default driver.
-        var classifierTier = _config.DefaultAdvisor?.ModelTier ?? _config.DefaultDriverTier;
-        var (workType, reasoning) = await new Classifier(Client(classifierTier)).ClassifyAsync(task, _config, ct);
-        run.Classified(workType, _config.RecordClassification ? reasoning : "(recording disabled)");
+        string workType;
+        List<string> plan;
+        int idx, escalations;
+        Dictionary<string, int> loopCounts, attempt;
+        List<(string phase, string doc)> handoff;
+        string? priorSession;
 
-        var wt = _config.WorkTypes[workType];   // classifier only returns validated keys
+        if (resume is not null)
+        {
+            workType = resume.WorkType ?? _config.WorkTypes.Keys.First();
+            plan = new List<string>(resume.Plan);
+            idx = resume.Idx;
+            loopCounts = new Dictionary<string, int>(resume.LoopCounts, StringComparer.Ordinal);
+            attempt = new Dictionary<string, int>(resume.Attempt, StringComparer.Ordinal);
+            escalations = resume.Escalations;
+            handoff = resume.Handoff.Select(h => (h.Phase, h.Doc)).ToList();
+            priorSession = resume.PriorSession;
+        }
+        else
+        {
+            // Intake classifier — one judgment, recorded. Use the advisor tier if there is
+            // one (highest-leverage call), else the default driver.
+            var classifierTier = _config.DefaultAdvisor?.ModelTier ?? _config.DefaultDriverTier;
+            var (wtName, reasoning) = await new Classifier(Client(classifierTier)).ClassifyAsync(task, _config, ct);
+            run.Classified(wtName, _config.RecordClassification ? reasoning : "(recording disabled)");
+            workType = wtName;
+            plan = new List<string>(_config.WorkTypes[workType].Phases);
+            idx = 0; escalations = 0;
+            loopCounts = new(StringComparer.Ordinal);
+            attempt = new(StringComparer.Ordinal);
+            handoff = new();
+            priorSession = null;
+        }
 
-        // 2. Spine + work_type -> ordered phase plan (floors guaranteed by the loader).
-        var plan = new List<string>(wt.Phases);
-        var idx = 0;
-        var loopCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-        var escalations = 0;
-        var attempt = new Dictionary<string, int>(StringComparer.Ordinal);
-        var handoff = new List<(string phase, string doc)>();
-        string? priorSession = null;
         var stepBudget = plan.Count * 6 + 16;   // backstop against any routing pathology
+
+        void Checkpoint(string status) => _runStore?.Save(new RunSnapshot
+        {
+            RunId = _runId, Task = task, WorkflowFile = _workflowFile ?? "", Status = status,
+            FailReason = run.FailReason, WorkType = run.WorkType, ClassifierReasoning = run.ClassifierReasoning,
+            Plan = new List<string>(plan), Idx = idx,
+            LoopCounts = new Dictionary<string, int>(loopCounts),
+            Attempt = new Dictionary<string, int>(attempt),
+            Escalations = escalations,
+            Handoff = handoff.Select(h => new HandoffEntry { Phase = h.phase, Doc = h.doc }).ToList(),
+            PriorSession = priorSession,
+            Events = run.Events.ToList(),
+            Cost = run.Cost,
+        });
 
         while (idx < plan.Count)
         {
-            if (stepBudget-- <= 0) { run.RunEnd(RunStatus.Failed, "step budget exhausted (routing loop)"); return run; }
+            if (stepBudget-- <= 0) { run.RunEnd(RunStatus.Failed, "step budget exhausted (routing loop)"); Checkpoint("failed"); return run; }
+
+            // Checkpoint reflects "about to run plan[idx]" — so a crash here resumes by
+            // re-running exactly this phase, with prior handoff/recall intact.
+            Checkpoint("running");
 
             var phaseId = plan[idx];
             var phase = _config.Phase(phaseId)!;
@@ -105,7 +166,6 @@ public sealed class WorkflowScheduler
             // Author the working-set handoff (v0.5 machinery) — also the judge gate's input.
             var doc = await new HandoverGenerator(Client(phase.DriverTier))
                 .GenerateAsync(result.Conversation, null, ct);
-            // Replace any prior doc for this phase (a loop re-authors it) then append.
             handoff.RemoveAll(h => h.phase == phaseId);
             handoff.Add((phaseId, doc));
             run.PhaseEnd(phaseId, doc);
@@ -114,7 +174,7 @@ public sealed class WorkflowScheduler
             if (result.Escalation.Requested)
             {
                 if (++escalations > EscalationBudget)
-                { run.RunEnd(RunStatus.Failed, "escalation budget exhausted"); return run; }
+                { run.RunEnd(RunStatus.Failed, "escalation budget exhausted"); Checkpoint("failed"); return run; }
                 var target = result.Escalation.TargetPhase!;
                 run.Escalation(phaseId, target, result.Escalation.Reason);
                 RouteTo(plan, ref idx, target);
@@ -122,10 +182,9 @@ public sealed class WorkflowScheduler
             }
 
             // 3b. Gate.
+            if (phase.Gate.Type == GateKind.None) { idx++; continue; }
             var outcome = await EvaluateGateAsync(phase, task, doc, result.Conversation, ct);
             var kind = phase.Gate.Type.ToString().ToLowerInvariant();
-            if (phase.Gate.Type == GateKind.None) { idx++; continue; }
-
             run.Gate(phaseId, kind, outcome.Pass ? "pass" : "fail", outcome.Reason);
 
             if (outcome.Pass) { idx++; continue; }
@@ -136,17 +195,18 @@ public sealed class WorkflowScheduler
 
             // Gate failed -> route by on_fail, bounded by max_loops on the gated phase.
             var route = phase.Gate.OnFail;
-            if (route == "stop") { run.RunEnd(RunStatus.Failed, $"{phaseId} gate failed: {outcome.Reason}"); return run; }
+            if (route == "stop") { run.RunEnd(RunStatus.Failed, $"{phaseId} gate failed: {outcome.Reason}"); Checkpoint("failed"); return run; }
 
             loopCounts[phaseId] = loopCounts.GetValueOrDefault(phaseId) + 1;
             if (loopCounts[phaseId] > phase.Gate.MaxLoops)
-            { run.RunEnd(RunStatus.Failed, $"{phaseId} gate exceeded max_loops ({phase.Gate.MaxLoops})"); return run; }
+            { run.RunEnd(RunStatus.Failed, $"{phaseId} gate exceeded max_loops ({phase.Gate.MaxLoops})"); Checkpoint("failed"); return run; }
 
             if (route == "loop") continue;          // re-run the same phase
             RouteTo(plan, ref idx, route);          // re-enter a named earlier phase (e.g. verify -> implement)
         }
 
         run.RunEnd(RunStatus.Completed, "");
+        Checkpoint("completed");
         return run;
     }
 
@@ -178,7 +238,7 @@ public sealed class WorkflowScheduler
         var systemPrompt = BuildPhasePrompt(phase, task, handoff, eligibleSkills, loadAll);
         var tools = BuildPhaseTools(phase, conversation, consult, escalation, priorSession, run);
 
-        var agent = new Agent(Client(phase.DriverTier), new ToolRegistry(tools), systemPrompt, _agentObserver);
+        var agent = new Agent(Client(phase.DriverTier), new ToolRegistry(tools), systemPrompt, _agentObserver, _gate);
         await agent.RunTurnAsync(conversation, ct);
 
         return new PhaseResult(conversation, consult, escalation);

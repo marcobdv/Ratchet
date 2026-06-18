@@ -15,10 +15,22 @@ namespace CodeStack.Ratchet.Core;
 /// </summary>
 public static class GitTools
 {
+    /// <summary>Read-only git tools (status + diff). Safe to expose ungated.</summary>
     public static IEnumerable<ITool> Build(string workingDirectory)
     {
         yield return new GitStatusTool(workingDirectory);
         yield return new GitDiffTool(workingDirectory);
+    }
+
+    /// <summary>
+    /// Mutating git tools (branch + commit) — the "land" capability. These change
+    /// history, so they belong behind the <see cref="IToolGate"/>; they're kept out of
+    /// <see cref="Build"/> so a caller adds them deliberately, never by accident.
+    /// </summary>
+    public static IEnumerable<ITool> BuildWrite(string workingDirectory)
+    {
+        yield return new GitCreateBranchTool(workingDirectory);
+        yield return new GitCommitTool(workingDirectory);
     }
 
     internal static async Task<string> RunGitAsync(string workingDirectory, IEnumerable<string> args, CancellationToken ct)
@@ -92,5 +104,60 @@ public sealed class GitDiffTool : ITool
         if (staged) args.Add("--staged");
         if (!string.IsNullOrWhiteSpace(path)) { args.Add("--"); args.Add(path!); }
         return GitTools.RunGitAsync(_cwd, args, ct);
+    }
+}
+
+/// <summary>Create and switch to a new branch. Mutating — governs via the permission gate.</summary>
+public sealed class GitCreateBranchTool : ITool
+{
+    private readonly string _cwd;
+    public GitCreateBranchTool(string cwd) => _cwd = cwd;
+
+    public string Name => "git_create_branch";
+    public string Description => "Create a new git branch and switch to it.";
+    public string InputSchemaJson => """
+        {"type":"object","properties":{"name":{"type":"string","description":"New branch name."}},"required":["name"]}
+        """;
+
+    public Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
+    {
+        var name = Json.GetString(inputJson, "name");
+        return GitTools.RunGitAsync(_cwd, new[] { "checkout", "-b", name }, ct);
+    }
+}
+
+/// <summary>
+/// Stage and commit the working tree — the terminal "land" action. Mutating, so it
+/// only runs when the permission gate allows it. Stages everything by default; set
+/// add_all=false to commit only what's already staged.
+/// </summary>
+public sealed class GitCommitTool : ITool
+{
+    private readonly string _cwd;
+    public GitCommitTool(string cwd) => _cwd = cwd;
+
+    public string Name => "git_commit";
+    public string Description =>
+        "Commit the working tree with a message. By default stages all changes first (add_all). " +
+        "Changes history — only runs if the permission gate allows it.";
+    public string InputSchemaJson => """
+        {"type":"object","properties":{"message":{"type":"string","description":"Commit message."},"add_all":{"type":"boolean","description":"Stage all changes before committing (default true)."}},"required":["message"]}
+        """;
+
+    public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
+    {
+        var message = Json.GetString(inputJson, "message");
+        var addAll = true;
+        using (var doc = System.Text.Json.JsonDocument.Parse(inputJson))
+            if (doc.RootElement.TryGetProperty("add_all", out var a) &&
+                (a.ValueKind == System.Text.Json.JsonValueKind.True || a.ValueKind == System.Text.Json.JsonValueKind.False))
+                addAll = a.GetBoolean();
+
+        if (addAll)
+        {
+            var add = await GitTools.RunGitAsync(_cwd, new[] { "add", "-A" }, ct);
+            if (add.StartsWith("could not run git", StringComparison.Ordinal)) return add;
+        }
+        return await GitTools.RunGitAsync(_cwd, new[] { "commit", "-m", message }, ct);
     }
 }

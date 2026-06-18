@@ -451,3 +451,24 @@ regression, which is the exact failure the floors exist to prevent.
 The control flow is covered by a deterministic test harness (a scripted `ILlmClient`
 plus a real command gate) exercising classify → phases → judge loop-back →
 command-gate loop-back → escalation, alongside the four loader-validation rules.
+
+**v0.9 additions.** Five things the design called for but v0.8 left open:
+
+- **Permission gate** (`Core/ToolGate.cs`, an `IToolGate` in `Agent.ExecuteToolAsync`).
+  The design left "no PR on red" to gates but left the *tool*-level gate unbuilt; it now
+  exists and every workflow phase agent is constructed with it. A `land` phase (git
+  branch + commit via new mutating `git_commit`/`git_create_branch` tools) finally lets a
+  run ship its work rather than leave an uncommitted diff.
+- **Run records are persisted** (`IRunStore`/`FileRunStore`, `.ratchet/runs/<id>.json`).
+  The design wanted "a bad skip is diffable after the fact"; in v0.8 the record was
+  in-memory only. Now it's durable and inspectable (`--runs`/`--run`).
+- **Per-tier cost** (`MeteredLlmClient` → `CostTally` on the run). The design's whole
+  cheap-driver/frontier-gate economics were unmeasurable; a metering wrapper on each tier
+  makes them legible without touching any call site.
+- **Resumable runs.** The snapshot doubles as a checkpoint (loop state + handoff + cost);
+  an interrupted run continues from the last completed phase via `--workflow-resume`,
+  without re-classifying — the unattended-run prerequisite the design kept gesturing at.
+
+These are verified by a second deterministic harness (gate allow/deny in the loop, run
+store roundtrip, cost tally across a full run, interrupt → checkpoint → resume, and a
+real `git_commit` both succeeding and being blocked by a deny gate).

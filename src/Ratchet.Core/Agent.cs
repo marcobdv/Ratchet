@@ -19,13 +19,15 @@ public sealed class Agent
     private readonly ToolRegistry _tools;
     private readonly string _systemPrompt;
     private readonly IAgentObserver _observer;
+    private readonly IToolGate _gate;
 
-    public Agent(ILlmClient llm, ToolRegistry tools, string systemPrompt, IAgentObserver observer)
+    public Agent(ILlmClient llm, ToolRegistry tools, string systemPrompt, IAgentObserver observer, IToolGate? gate = null)
     {
         _llm = llm;
         _tools = tools;
         _systemPrompt = systemPrompt;
         _observer = observer;
+        _gate = gate ?? AllowAllGate.Instance;
     }
 
     /// <summary>
@@ -71,6 +73,12 @@ public sealed class Agent
     {
         if (!_tools.TryGet(call.Name, out var tool))
             return ($"Unknown tool '{call.Name}'.", true);
+
+        // Permission gate: a denial comes back as an error result the model can adapt
+        // to, never an exception — the guarantee lives here, before the tool runs.
+        var decision = await _gate.CheckAsync(call.Name, call.InputJson, ct);
+        if (!decision.Allowed)
+            return ($"Permission denied for '{call.Name}': {decision.Reason}", true);
 
         try
         {

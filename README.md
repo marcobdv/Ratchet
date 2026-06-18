@@ -24,10 +24,35 @@ system prompt. Override the model with `RATCHET_MODEL` (defaults to
 tool drives with `RATCHET_SHELL` — `bash`, `cmd`, or `pwsh` (PowerShell 7+).
 Unset, it defaults to cmd on Windows and bash elsewhere.
 
-Pick the model provider with `RATCHET_PROVIDER`: unset/`anthropic` runs Anthropic
-through the `IChatClient` seam (`AnthropicChatClient`); `anthropic-native` uses the
-original hand-rolled wire `ILlmClient` (kept for wire-level transparency). Other
-`IChatClient` providers (OpenAI, Azure, Ollama) drop in as one more case in `Program`.
+**Not tied to Anthropic.** Pick the backend with `RATCHET_PROVIDER` — Ratchet talks to
+any of them (and every other config, tools, sessions, workflows, work the same):
+
+| `RATCHET_PROVIDER` | endpoint | key env | notes |
+|---|---|---|---|
+| `anthropic` *(default)* | Anthropic Messages API | `ANTHROPIC_API_KEY` | via `AnthropicChatClient` |
+| `anthropic-native` | Anthropic Messages API | `ANTHROPIC_API_KEY` | hand-rolled wire `ILlmClient` |
+| `openrouter` | `openrouter.ai/api/v1` | `OPENROUTER_API_KEY` (or `RATCHET_API_KEY`) | **one key, hundreds of models** |
+| `openai` | `api.openai.com/v1` | `OPENAI_API_KEY` (or `RATCHET_API_KEY`) | |
+| `groq` | `api.groq.com/openai/v1` | `GROQ_API_KEY` (or `RATCHET_API_KEY`) | |
+| `local` / `ollama` | `RATCHET_LOCAL_BASE_URL` (default Ollama) | `RATCHET_LOCAL_API_KEY` (optional) | LM Studio / vLLM / llama.cpp |
+| *anything else* | `RATCHET_BASE_URL` | `RATCHET_API_KEY` | any OpenAI-compatible endpoint |
+
+Everything except Anthropic flows through one hand-rolled OpenAI-compatible client
+(`Llm/OpenAiChatClient.cs`). For non-Anthropic providers set `RATCHET_MODEL` to that
+backend's model id (e.g. OpenRouter `anthropic/claude-sonnet-4` or `openai/gpt-4o`;
+Groq `llama-3.3-70b-versatile`). `RATCHET_BASE_URL` overrides the endpoint for any
+OpenAI-compatible provider (proxies, gateways). OpenRouter attribution headers come from
+`RATCHET_OPENROUTER_REFERER` / `RATCHET_OPENROUTER_TITLE`. Example:
+
+```powershell
+$env:RATCHET_PROVIDER = "openrouter"
+$env:OPENROUTER_API_KEY = "sk-or-..."
+$env:RATCHET_MODEL = "anthropic/claude-sonnet-4"   # or openai/gpt-4o, google/gemini-2.5-pro, …
+dotnet run --project src/Ratchet.Cli
+```
+
+The same provider names work for a workflow's per-tier `models:` block, so one workflow
+can mix backends (a cheap `local` driver with an `openrouter` frontier judge).
 
 The extra tools light up from the working directory: a `.mcp.json` connects MCP
 servers, `.ratchet/skills/<name>/SKILL.md` (or `.claude/skills/…`) registers skills,
@@ -72,10 +97,17 @@ ratchet --workflow workflows/ratchet-dev.yaml "add a --version flag to the CLI"
 
 The orchestrator is **deterministic** (the spine, the gates, loop-back, escalation);
 LLM judgment shows up only at the intake classifier (which sizes the task into a
-`work_type`) and at judge gates. Floors (`verify`, `review`) always run. Phase-to-phase
-context uses the v0.5 handover + `recall` machinery. Local/OpenAI-compatible driver
-tiers point at any `/v1` endpoint via `RATCHET_LOCAL_BASE_URL` (e.g. Ollama). The full
-design and rationale is `docs/workflow-orchestration.md`.
+`work_type`) and at judge gates. Floors (`verify`, `review`) always run, and a final
+`land` phase branches + commits the reviewed change (`git_commit`, governed by the
+permission gate). Phase-to-phase context uses the v0.5 handover + `recall` machinery.
+Local/OpenAI-compatible driver tiers point at any `/v1` endpoint via
+`RATCHET_LOCAL_BASE_URL` (e.g. Ollama).
+
+Every run is recorded to `.ratchet/runs/<id>.json` — the classification + reasoning, the
+event trace, and **per-tier token cost** (so "are the cheap drivers actually carrying the
+load?" is answerable). Inspect with `ratchet --runs` / `ratchet --run <id>`. An interrupted
+run checkpoints after each phase and continues with `ratchet --workflow-resume <id>`. The
+full design and rationale is `docs/workflow-orchestration.md`.
 
 Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
 JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
@@ -133,11 +165,12 @@ doc'd feature plugs in:
 
 Still no **silent in-place compaction**: the long-session answer remains *handover*,
 now also auto-triggered when context crosses `RATCHET_CONTEXT_LIMIT` (v0.7) — a
-self-authored summary, never a quiet lossy truncation. And still no **permission
-gates** — `bash`, the Roslyn rename, and even the auto-compaction are YOLO, like pi;
-`git_status`/`git_diff` are read-only precisely because staging/committing would need
-the gate that doesn't exist yet. The `explore` sub-agent is read-only by prompt, not
-by a gate. A permission seam is the known next rung; that's the curriculum.
+self-authored summary, never a quiet lossy truncation. The **permission gate** that was
+the conspicuous gap now exists (v0.9, `IToolGate`) but is **off by default** — Ratchet
+stays pi-plain YOLO unless you set `RATCHET_GATE=prompt` (or `deny`), at which point
+mutating tools (`bash`, `write`, `edit`, `git_commit`, `git_create_branch`, the Roslyn
+rename) require approval while read-only tools always pass. The `explore` sub-agent is
+still read-only by prompt, not by a gate.
 
 > **v0.1 — streaming.** Responses stream over SSE: assistant text appears
 > token-by-token, and tool-call arguments are reassembled from `input_json_delta`
@@ -228,6 +261,33 @@ by a gate. A permission seam is the known next rung; that's the curriculum.
 > `ratchet --workflow <file.yaml> "<task>"`; the design and the resolved open forks are in
 > `docs/workflow-orchestration.md`. The agent loop, tree, and handover never changed — the
 > orchestrator is plain control flow above the seams.
+>
+> **v0.9 — gates, run records, cost, resume, land.** Five elaborations that make the
+> orchestrator trustworthy and close the "produces uncommitted diffs" gap:
+> - **Permission gate** (`Core/ToolGate.cs`). An `IToolGate` consulted in
+>   `Agent.ExecuteToolAsync` *before* a tool runs — a denial returns to the model as an
+>   error result, not a crash, so the guarantee lives in the loop. Default `AllowAllGate`
+>   (unchanged YOLO); `RATCHET_GATE=prompt|deny` turns it on for mutating tools. The REPL
+>   agent and every workflow phase share it.
+> - **Git write + a `land` phase.** `git_commit` / `git_create_branch` (mutating, so the
+>   gate governs them) let the workflow actually *ship*: a terminal `land` phase branches
+>   and commits the reviewed change instead of leaving a diff on the floor.
+> - **Persisted run records** (`IRunStore` / `FileRunStore`). The classification, event
+>   trace, and cost are written to `.ratchet/runs/<id>.json` — so "a bad skip is diffable
+>   after the fact" is finally true, not a console line that scrolled away. `--runs` / `--run`.
+> - **Per-tier cost accounting.** A `MeteredLlmClient` wraps every tier, so driver /
+>   classifier / judge / advisor / handover tokens are tallied by tier with no call site
+>   changes — making the "cheap drivers, frontier gates" economics measurable instead of
+>   asserted.
+> - **Resumable runs.** The scheduler checkpoints before each phase; a run interrupted by a
+>   transient failure continues from the last good phase with `--workflow-resume <id>`,
+>   without re-classifying or re-running completed phases — the prerequisite for unattended
+>   runs. Each rides an existing seam; the loop is still untouched.
+> - **Provider-agnostic.** `RATCHET_PROVIDER` now selects Anthropic, **OpenRouter** (one key,
+>   hundreds of models), OpenAI, Groq, a local server, or any OpenAI-compatible endpoint via
+>   `RATCHET_BASE_URL` — all through the existing `ILlmClient` seam (`OpenAiChatClient` for the
+>   non-Anthropic wire). The same provider names work per-tier in a workflow, so one run can
+>   mix a cheap local driver with an OpenRouter frontier judge. See the provider table above.
 
 ## Namespacing
 
