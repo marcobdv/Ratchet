@@ -1,0 +1,103 @@
+# Ratchet development workflow — a concrete instance of docs/workflow-orchestration.md.
+#
+# Run it:  ratchet --workflow workflows/ratchet-dev.yaml "add a --version flag to the CLI"
+#
+# Tiers default to the hosted Anthropic API so this runs with just ANTHROPIC_API_KEY.
+# To put the cheap mechanical phases on a local model, point driver_cheap at a `local`
+# tier and set RATCHET_LOCAL_BASE_URL (e.g. http://localhost:11434/v1 for Ollama).
+#
+# NOTE: the design doc's illustrative `trivial` runs [implement, verify] only, but the
+# doc also makes `review` a floor and the loader enforces "every floor must run". This
+# file follows the *rule* (floors = verify + review run in every work_type) over the
+# illustrative sample — the merge-readiness gate stays mandatory.
+
+version: 1
+name: ratchet-dev
+
+classifier:
+  output: work_type
+  record: true
+
+models:
+  driver_cheap:     { provider: anthropic, model: claude-haiku-4-5-20251001 }
+  driver_mid:       { provider: anthropic, model: claude-sonnet-4-6 }
+  advisor_frontier: { provider: anthropic, model: claude-opus-4-8 }
+  # Example local tier (Ollama / LM Studio / vLLM); swap driver_cheap to this:
+  # driver_local:   { provider: local,     model: qwen2.5-coder:14b }
+
+defaults:
+  driver: driver_cheap
+  advisor:
+    model: advisor_frontier
+    consult_when: >
+      Before your first file-writing action on a non-trivial change, when the same
+      error recurs twice, and before declaring the phase done.
+    max_consults: 3
+
+skill_loading:
+  threshold: 4
+  strategy_above: progressive
+
+# Fixed, ordered, maximal spine. Structure only — no skills here.
+spine:
+  - id: research
+    skippable: true
+    role: "Investigate the codebase; surface unknowns, impact, and the files involved."
+    driver: driver_cheap
+    advisor: { inherit: defaults }
+    tools: [read, recall, bash, consult_advisor]
+    gate: { type: none }
+
+  - id: plan
+    skippable: true
+    role: "Produce a concrete change plan: what to edit, edge cases, and the test approach."
+    driver: driver_mid
+    advisor: { inherit: defaults }
+    tools: [read, recall, consult_advisor]
+    gate: { type: judge, agent: spec-review, fresh_context: true, model: advisor_frontier, on_fail: loop, max_loops: 3 }
+
+  - id: implement
+    skippable: false
+    role: "Make the change. Read before you edit; keep edits minimal and conventional."
+    driver: driver_cheap
+    advisor: { inherit: defaults }
+    tools: [read, write, edit, bash, load_skill, consult_advisor, request_escalation]
+    gate: { type: none }
+    escalation: [plan, research]
+
+  - id: verify
+    skippable: false            # FLOOR — the machine-checked "done"
+    role: "Prove it: build and tests are green."
+    driver: driver_cheap
+    advisor: null               # tests are the judge; no model needed
+    tools: [bash, read]
+    gate: { type: command, run: "dotnet build -clp:ErrorsOnly", pass_on: exit_zero, on_fail: implement, max_loops: 3 }
+
+  - id: review
+    skippable: false            # FLOOR — merge-readiness
+    role: "Check the diff for conventions, scope, and regression risk."
+    driver: driver_cheap
+    advisor: null
+    tools: [read, recall, git_diff]
+    gate: { type: judge, agent: code-review, fresh_context: true, model: advisor_frontier, on_fail: loop, max_loops: 2 }
+
+# The classifier selects one overlay. Each MUST include the floors (verify, review).
+# Skills are empty here so this file loads on a repo with no skills registered; add
+# them per (phase, work_type) as `phase: [skill-name, ...]` once skills exist.
+work_types:
+
+  trivial:
+    phases: [implement, verify, review]
+    skills: {}
+
+  small_change:
+    phases: [plan, implement, verify, review]
+    skills: {}
+
+  feature:
+    phases: [research, plan, implement, verify, review]
+    skills: {}
+
+  bugfix:
+    phases: [implement, verify, review]
+    skills: {}

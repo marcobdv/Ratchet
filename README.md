@@ -59,6 +59,24 @@ Two more env knobs: `RATCHET_CONTEXT_LIMIT` sets an input-token threshold past w
 Ratchet auto-compacts (see v0.7); `RATCHET_PTY=1` opts the `bash` tool into a Windows
 ConPTY pseudo-console (a real TTY) instead of redirected pipes.
 
+### Workflows (phased orchestration)
+
+Instead of one undifferentiated agent, run a task through a fixed sequence of phases
+(`research → plan → implement → verify → review`), each with its own role, tool subset,
+model tier, and skills — cheap models do the bulk, frontier spend is concentrated at
+gates:
+
+```powershell
+ratchet --workflow workflows/ratchet-dev.yaml "add a --version flag to the CLI"
+```
+
+The orchestrator is **deterministic** (the spine, the gates, loop-back, escalation);
+LLM judgment shows up only at the intake classifier (which sizes the task into a
+`work_type`) and at judge gates. Floors (`verify`, `review`) always run. Phase-to-phase
+context uses the v0.5 handover + `recall` machinery. Local/OpenAI-compatible driver
+tiers point at any `/v1` endpoint via `RATCHET_LOCAL_BASE_URL` (e.g. Ollama). The full
+design and rationale is `docs/workflow-orchestration.md`.
+
 Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
 JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
 `.ratchet/ratchet.db` and inserts only new nodes per turn (no full rewrite).
@@ -193,6 +211,23 @@ by a gate. A permission seam is the known next rung; that's the curriculum.
 >
 > Permission gates are still the conspicuous gap — the next rung, and the reason git here is
 > read-only.
+>
+> **v0.8 — workflow orchestration.** A phased orchestrator on top of the loop
+> (`src/Ratchet.Workflow`, +YamlDotNet; Core stays dependency-free). One LLM call at
+> intake sizes the task into a `work_type`; a fixed, ordered spine then runs the selected
+> phase subset, each phase its own `Agent` with its own role/tools/model-tier/skills. The
+> scheduler is deterministic — it runs phases, evaluates **gates** (command gates route on
+> an exit code; judge gates spend a frontier model on judgment an exit code can't express),
+> and routes: pass advances, fail **loops back** (bounded), and a phase that proves bigger
+> than its sizing **escalates** back up the spine. Floors (`verify`, `review`) always run.
+> The phase-to-phase handoff *is* v0.5: an authored handover doc + `recall` into the prior
+> phase's transcript. A second `ILlmClient` (`OpenAiChatClient`) lets cheap `local` driver
+> tiers run on any OpenAI-compatible endpoint while frontier judges stay hosted. The intake
+> classification, every gate outcome, each advisor consult, and advisor↔gate conflicts are
+> recorded on the run, so a bad skip is diffable after the fact. Run it with
+> `ratchet --workflow <file.yaml> "<task>"`; the design and the resolved open forks are in
+> `docs/workflow-orchestration.md`. The agent loop, tree, and handover never changed — the
+> orchestrator is plain control flow above the seams.
 
 ## Namespacing
 

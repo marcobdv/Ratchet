@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CodeStack.Ratchet.Workflow</RootNamespace>
+    <AssemblyName>Ratchet.Workflow</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Declarative workflow config is YAML (see docs/workflow-orchestration.md).
+         The moment a condition needs real logic it becomes C# the scheduler runs,
+         not YAML it interprets — so this stays a plain deserialiser. -->
+    <PackageReference Include="YamlDotNet" Version="16.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
+  </ItemGroup>
+
+</Project>

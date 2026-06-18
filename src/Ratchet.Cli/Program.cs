@@ -4,6 +4,7 @@ using CodeStack.Ratchet.Llm;
 using CodeStack.Ratchet.Storage.Sqlite;
 using CodeStack.Ratchet.Tools.Mcp;
 using CodeStack.Ratchet.Tools.Roslyn;
+using CodeStack.Ratchet.Workflow;
 
 // Register MSBuild before any Roslyn MSBuildWorkspace type loads (must be first).
 MsBuildBootstrap.Ensure();
@@ -126,6 +127,61 @@ await using var mcp = await McpToolset.ConnectAsync(Directory.GetCurrentDirector
 baseTools.AddRange(mcp.Tools);
 
 var observer = new ConsoleObserver();
+
+// `ratchet --workflow <file.yaml> "<task>"` runs the task through a phased workflow
+// orchestrator (research→plan→implement→verify→review) instead of the single REPL
+// loop. The scheduler is deterministic; LLM judgment shows up only at the intake
+// classifier and judge gates. See docs/workflow-orchestration.md.
+var wfIdx = Array.IndexOf(args, "--workflow");
+if (wfIdx >= 0 && wfIdx + 1 < args.Length)
+{
+    var wfFile = args[wfIdx + 1];
+    var wfTask = string.Join(' ', args.Skip(wfIdx + 2));
+    if (string.IsNullOrWhiteSpace(wfTask))
+    {
+        Console.Write("workflow task> ");
+        wfTask = Console.ReadLine() ?? "";
+    }
+    if (string.IsNullOrWhiteSpace(wfTask)) { Console.Error.WriteLine("no task given"); return 1; }
+
+    // Tier -> ILlmClient. 'anthropic' uses the hosted API; 'local'/'openai' point at any
+    // OpenAI-compatible endpoint (Ollama/LM Studio/vLLM) via RATCHET_LOCAL_BASE_URL.
+    var localBase = Environment.GetEnvironmentVariable("RATCHET_LOCAL_BASE_URL") ?? "http://localhost:11434/v1";
+    var localKey = Environment.GetEnvironmentVariable("RATCHET_LOCAL_API_KEY");
+    Func<ModelTier, ILlmClient> clientFactory = tier => tier.Provider.ToLowerInvariant() switch
+    {
+        "anthropic" => new ChatClientLlm(new AnthropicChatClient(apiKey, tier.Model), tier.Model),
+        "local" or "openai" => new ChatClientLlm(new OpenAiChatClient(localBase, tier.Model, localKey), tier.Model),
+        _ => throw new InvalidOperationException($"workflow: unknown provider '{tier.Provider}' for tier '{tier.Name}'."),
+    };
+
+    // Base tools resolve by name from the already-assembled set (read/write/edit/bash/
+    // load_skill/run_tests/git_*/roslyn_*/…). consult_advisor, recall and request_escalation
+    // are supplied per-phase by the scheduler, so they're intentionally not here.
+    var toolByName = new Dictionary<string, ITool>(StringComparer.Ordinal);
+    foreach (var t in baseTools) toolByName[t.Name] = t;
+    BaseToolResolver resolveTool = n => toolByName.GetValueOrDefault(n);
+
+    var knownSkills = skills.Skills.Select(s => s.Name).ToList();
+    WorkflowConfig wf;
+    try { wf = WorkflowLoader.Load(wfFile, knownSkills); }
+    catch (WorkflowConfigException ex) { Console.Error.WriteLine(ex.Message); return 1; }
+
+    var runId = "wf-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+    Console.WriteLine($"workflow '{wf.Name}'  ·  run {runId}  ·  task: {wfTask}\n");
+
+    var scheduler = new WorkflowScheduler(
+        wf, clientFactory, resolveTool, store, shell, runId,
+        skills, observer, new ConsoleWorkflowObserver());
+
+    WorkflowRun result;
+    try { result = await scheduler.RunAsync(wfTask, CancellationToken.None); }
+    catch (Exception ex) { Console.Error.WriteLine($"[workflow error] {ex.Message}"); return 1; }
+
+    (llm as IDisposable)?.Dispose();
+    (store as IDisposable)?.Dispose();
+    return result.Status == RunStatus.Completed ? 0 : 2;
+}
 
 // The agent is rebuilt on compaction with a new system prompt + recall tool, so
 // construct it through a factory over the (mutable) systemPrompt and recallTool.
@@ -461,5 +517,51 @@ sealed class ConsoleObserver : IAgentObserver
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine($"  · tokens: {inputTokens} in / {outputTokens} out");
         Console.ResetColor();
+    }
+}
+
+/// <summary>
+/// Renders the workflow run trace to the console: the classification, each phase
+/// start, consults, gate outcomes, escalations, and conflicts. This is the live view
+/// of the recorded run — the same events <see cref="WorkflowRun"/> keeps for audit.
+/// </summary>
+sealed class ConsoleWorkflowObserver : IWorkflowObserver
+{
+    private static void Line(ConsoleColor c, string s)
+    {
+        Console.ForegroundColor = c;
+        Console.WriteLine(s);
+        Console.ResetColor();
+    }
+
+    public void Classified(string workType, string reasoning) =>
+        Line(ConsoleColor.Magenta, $"▣ classified: {workType} — {reasoning}");
+
+    public void PhaseStart(string phaseId, string driverTier, IReadOnlyList<string> skills, string loadPolicy) =>
+        Line(ConsoleColor.Cyan, $"\n┌─ phase: {phaseId}  ·  driver: {driverTier}  ·  skills: [{string.Join(", ", skills)}] ({loadPolicy})");
+
+    public void Consult(string phaseId, int n, int max, string advice) =>
+        Line(ConsoleColor.Blue, $"│  advisor {n}/{max}: {Trunc(advice)}");
+
+    public void Gate(string phaseId, string kind, string outcome, string reason) =>
+        Line(outcome == "pass" ? ConsoleColor.Green : ConsoleColor.Red,
+            $"└─ gate [{kind}] → {outcome.ToUpperInvariant()}  {Trunc(reason)}");
+
+    public void Escalation(string fromPhase, string toPhase, string reason) =>
+        Line(ConsoleColor.Yellow, $"↑ escalation {fromPhase} → {toPhase}: {Trunc(reason)}");
+
+    public void Conflict(string phaseId, string detail) =>
+        Line(ConsoleColor.DarkYellow, $"⚠ conflict in {phaseId}: {detail}");
+
+    public void PhaseEnd(string phaseId, string summary) { /* the gate line below is the visible marker */ }
+
+    public void RunEnd(RunStatus status, string reason) =>
+        Line(status == RunStatus.Completed ? ConsoleColor.Green : ConsoleColor.Red,
+            $"\n■ run {status}{(reason.Length > 0 ? ": " + reason : "")}");
+
+    private static string Trunc(string s)
+    {
+        s = s.ReplaceLineEndings(" ").Trim();
+        return s.Length > 160 ? s[..160] + "…" : s;
     }
 }

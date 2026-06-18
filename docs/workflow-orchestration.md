@@ -1,11 +1,11 @@
 # Workflow orchestration — design goal
 
-> **Status:** design, not yet implemented. The current baseline is **v0.5**
-> (retrieval-backed handover). This document is a *goal* to hand to an
-> implementing agent. It captures decisions **and their rationale** on purpose —
-> so the decisions aren't silently re-litigated or reversed. Where a question is
-> genuinely open, it's listed as open (see *Open forks*); don't guess those,
-> surface them.
+> **Status:** **implemented** in `src/Ratchet.Workflow` (v0.8). This document
+> remains the rationale of record — it captures decisions **and why** on purpose,
+> so they aren't silently re-litigated. The *Open forks* at the bottom were decided
+> deliberately during implementation; see **Implementation notes** at the very end
+> for how each was resolved and where the code lives. The original design text below
+> is preserved unchanged.
 
 ## Goal
 
@@ -400,3 +400,54 @@ checked, not vibed.
 v0.5: streaming agent loop, sessions as a branch tree, file + SQLite stores, and
 retrieval-backed handover (`/handover`, `ratchet --handover <id>`, `recall`).
 See `README.md`. Nothing in this document is built yet.
+
+## Implementation notes (v0.8 — `src/Ratchet.Workflow`)
+
+Built on the existing seams; `Agent.RunTurnAsync` is untouched. Map of the design to
+the code:
+
+| Design piece | Code |
+|---|---|
+| Validated config (spine, tiers, gates, work_types) | `WorkflowConfig.cs` |
+| YAML loader + the 4 "can't lie" rules | `WorkflowLoader.cs` |
+| Intake classifier (one call, recorded, graceful fallback) | `Classifier.cs` |
+| Scheduler (deterministic spine, gates, loop-back, escalation, handoff) | `WorkflowScheduler.cs` |
+| Command + judge gates | `Gates.cs` |
+| Advisor (reimplemented tool), before-first-write guard, escalation tool | `PhaseTools.cs` |
+| Run recording (classification, skips, consults, gate outcomes, conflicts) | `WorkflowRun.cs` |
+| Local/OpenAI-compatible driver tier | `Llm/OpenAiChatClient.cs` |
+| Entry point `ratchet --workflow <file> "<task>"` + console trace | `Cli/Program.cs` |
+| A concrete workflow | `workflows/ratchet-dev.yaml` |
+
+Phase-to-phase handoff is exactly v0.5: after each phase the scheduler authors a
+handover doc (`HandoverGenerator`), persists the phase transcript as a session, and
+hands the next phase the accumulated working-set docs plus a `recall` tool over the
+prior session. The judge gate's fresh-context input *is* that authored doc.
+
+**Open forks — how they were decided:**
+
+1. **Advisor stop signal?** No. The advisor only advises (course-corrects); it cannot
+   halt the driver. Keeping it strictly non-halting is what keeps it distinct from a
+   gate. Halting power stays with gates and the escalation lever.
+2. **Escalation re-runs the classifier, or re-enters the phase?** Re-enters the phase
+   (keeps the original sizing). `request_escalation` is bounded to the phase's
+   configured targets; the scheduler splices a pulled-in skipped phase back at its
+   spine-ordered position. A global escalation ceiling prevents thrash.
+3. **Is the skip decision recorded?** Yes — `classifier.record` persists choice +
+   reasoning on the run (`WorkflowRun`), so a bad skip is diffable after the fact.
+4. **Is `work_type` the right single key?** Kept as a single key for now (matches the
+   schema). Splitting "depth" (phases) from "kind" (skills) is noted as the next move
+   if a `feature` proving small/large becomes a real pain point.
+5. **Where does it live?** In Ratchet, as a Core-only project (`Ratchet.Workflow`,
+   +YamlDotNet) with the CLI as the composition root — Ratchet is the engine.
+
+**One deliberate deviation from the illustrative YAML:** the sample showed `trivial`
+running `[implement, verify]`, but the prose also makes `review` a floor and rule 1
+requires every floor to run. The loader enforces the *rule* (floors = `verify` +
+`review` run in every work_type); `workflows/ratchet-dev.yaml` includes both. The
+merge-readiness gate stays mandatory — skipping it is how a "trivial" change ships a
+regression, which is the exact failure the floors exist to prevent.
+
+The control flow is covered by a deterministic test harness (a scripted `ILlmClient`
+plus a real command gate) exercising classify → phases → judge loop-back →
+command-gate loop-back → escalation, alongside the four loader-validation rules.
