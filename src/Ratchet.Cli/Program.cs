@@ -5,6 +5,10 @@ using CodeStack.Ratchet.Storage.Sqlite;
 using CodeStack.Ratchet.Tools.Mcp;
 using CodeStack.Ratchet.Tools.Roslyn;
 using CodeStack.Ratchet.Workflow;
+using OpenTelemetry;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 // Register MSBuild before any Roslyn MSBuildWorkspace type loads (must be first).
 MsBuildBootstrap.Ensure();
@@ -47,6 +51,37 @@ if (runShowIdx >= 0 && runShowIdx + 1 < args.Length)
     foreach (var e in snap.Events) Console.WriteLine($"  [{e.Kind}] {e.Phase}: {e.Detail}");
     Console.WriteLine("  " + snap.Cost.Render().Replace("\n", "\n  "));
     if (snap.IsResumable) Console.WriteLine($"  (resumable: ratchet --workflow-resume {snap.RunId})");
+    return 0;
+}
+
+// Routing telemetry: the feedback loop. Aggregate the reactive layer's promotions per
+// (work_type, phase) across all run records — a high rate means the cheap predictive
+// default for that key was wrong and should be retuned upward (a readable diff, not a retrain).
+if (args.Contains("--routing-stats"))
+{
+    var runs = new FileRunStore(Directory.GetCurrentDirectory()).List();
+    var agg = new Dictionary<(string wt, string phase), (int starts, int fails, int promotes)>();
+    foreach (var snap in runs)
+    {
+        var wt = snap.WorkType ?? "-";
+        foreach (var ev in snap.Events)
+        {
+            if (ev.Phase == "-") continue;
+            var key = (wt, ev.Phase);
+            var cur = agg.GetValueOrDefault(key);
+            if (ev.Kind == "phase_start") cur.starts++;
+            else if (ev.Kind == "promote") cur.promotes++;
+            else if (ev.Kind == "gate" && ev.Detail.Contains("fail")) cur.fails++;
+            agg[key] = cur;
+        }
+    }
+    if (agg.Count == 0) { Console.WriteLine("(no routing telemetry yet — run some workflows)"); return 0; }
+    Console.WriteLine("routing telemetry by (work_type, phase) — high escalation_rate ⇒ retune that phase's cheap default upward:");
+    foreach (var ((wt, phase), v) in agg.OrderByDescending(a => a.Value.starts > 0 ? (double)a.Value.promotes / a.Value.starts : 0))
+    {
+        var rate = v.starts > 0 ? (double)v.promotes / v.starts : 0;
+        Console.WriteLine($"  {wt,-12} {phase,-10}  starts={v.starts,-4} gate_fails={v.fails,-4} promotes={v.promotes,-4} escalation_rate={rate:P0}");
+    }
     return 0;
 }
 
@@ -153,6 +188,12 @@ var observer = new ConsoleObserver();
 // mutating tools: bash/write/edit/git_commit/git_create_branch/roslyn_rename) | deny
 // (block them). Read-only tools always pass. Used by both the REPL agent and workflows.
 var gate = new ConsoleToolGate(Environment.GetEnvironmentVariable("RATCHET_GATE"));
+
+// OpenTelemetry: the agent/clients/workflow are instrumented in Core with the BCL
+// diagnostics API; here we wire the SDK + exporters. RATCHET_OTEL = off (default) |
+// console | otlp (to OTEL_EXPORTER_OTLP_ENDPOINT, default localhost:4317). Disposed at
+// exit to flush spans/metrics. Covers both the REPL and workflow runs below.
+using var otel = OTel.Enable(Environment.GetEnvironmentVariable("RATCHET_OTEL"), "ratchet");
 
 // `ratchet --workflow <file.yaml> "<task>"` runs the task through a phased workflow
 // orchestrator (research→plan→implement→verify→review) instead of the single REPL
@@ -515,38 +556,39 @@ static ILlmClient ResolveClient(string provider, string model)
             throw new InvalidOperationException($"{who}: set {string.Join(" or ", names)}.");
         return k!;
     }
-    static ILlmClient OpenAi(string defaultBase, string model, string? key, IReadOnlyDictionary<string, string>? headers = null) =>
-        new ChatClientLlm(new OpenAiChatClient(Env("RATCHET_BASE_URL") ?? defaultBase, model, key, extraHeaders: headers), model);
+    // 'system' is the gen_ai.system telemetry label.
+    static ILlmClient OpenAi(string defaultBase, string model, string? key, string system, IReadOnlyDictionary<string, string>? headers = null) =>
+        new ChatClientLlm(new OpenAiChatClient(Env("RATCHET_BASE_URL") ?? defaultBase, model, key, extraHeaders: headers), model, system: system);
 
     switch (provider)
     {
         case "anthropic":
-            return new ChatClientLlm(new AnthropicChatClient(RequireKey("Anthropic provider", "ANTHROPIC_API_KEY"), model), model);
+            return new ChatClientLlm(new AnthropicChatClient(RequireKey("Anthropic provider", "ANTHROPIC_API_KEY"), model), model, system: "anthropic");
         case "anthropic-native":
             return new AnthropicClient(RequireKey("Anthropic provider", "ANTHROPIC_API_KEY"), model);
 
         case "openrouter":
             return OpenAi("https://openrouter.ai/api/v1", model,
-                RequireKey("OpenRouter provider", "OPENROUTER_API_KEY", "RATCHET_API_KEY"),
+                RequireKey("OpenRouter provider", "OPENROUTER_API_KEY", "RATCHET_API_KEY"), "openrouter",
                 new Dictionary<string, string>
                 {
                     ["HTTP-Referer"] = Env("RATCHET_OPENROUTER_REFERER") ?? "https://github.com/marcobdv/Ratchet",
                     ["X-Title"] = Env("RATCHET_OPENROUTER_TITLE") ?? "Ratchet",
                 });
         case "openai":
-            return OpenAi("https://api.openai.com/v1", model, RequireKey("OpenAI provider", "OPENAI_API_KEY", "RATCHET_API_KEY"));
+            return OpenAi("https://api.openai.com/v1", model, RequireKey("OpenAI provider", "OPENAI_API_KEY", "RATCHET_API_KEY"), "openai");
         case "groq":
-            return OpenAi("https://api.groq.com/openai/v1", model, RequireKey("Groq provider", "GROQ_API_KEY", "RATCHET_API_KEY"));
+            return OpenAi("https://api.groq.com/openai/v1", model, RequireKey("Groq provider", "GROQ_API_KEY", "RATCHET_API_KEY"), "groq");
         case "local":
         case "ollama":
-            return OpenAi(Env("RATCHET_LOCAL_BASE_URL") ?? "http://localhost:11434/v1", model, Env("RATCHET_LOCAL_API_KEY"));
+            return OpenAi(Env("RATCHET_LOCAL_BASE_URL") ?? "http://localhost:11434/v1", model, Env("RATCHET_LOCAL_API_KEY"), "local");
 
         default:
             // "generic", "openai-compatible", or any unknown name: treat as an OpenAI-compatible
             // endpoint if a base URL is provided; otherwise fail with guidance.
             var baseUrl = Env("RATCHET_BASE_URL");
             if (!string.IsNullOrWhiteSpace(baseUrl))
-                return new ChatClientLlm(new OpenAiChatClient(baseUrl!, model, FirstEnv("RATCHET_API_KEY")), model);
+                return new ChatClientLlm(new OpenAiChatClient(baseUrl!, model, FirstEnv("RATCHET_API_KEY")), model, system: "openai-compatible");
             throw new InvalidOperationException(
                 $"unknown provider '{provider}'. Use anthropic | anthropic-native | openrouter | openai | groq | local " +
                 "| any OpenAI-compatible endpoint via RATCHET_BASE_URL (+ RATCHET_API_KEY).");
@@ -663,6 +705,9 @@ sealed class ConsoleWorkflowObserver : IWorkflowObserver
     public void Escalation(string fromPhase, string toPhase, string reason) =>
         Line(ConsoleColor.Yellow, $"↑ escalation {fromPhase} → {toPhase}: {Trunc(reason)}");
 
+    public void Promotion(string phaseId, string fromTier, string toTier) =>
+        Line(ConsoleColor.Yellow, $"⇪ promote {phaseId}: {fromTier} → {toTier} (red gate)");
+
     public void Conflict(string phaseId, string detail) =>
         Line(ConsoleColor.DarkYellow, $"⚠ conflict in {phaseId}: {detail}");
 
@@ -723,5 +768,43 @@ sealed class ConsoleToolGate : IToolGate
         return Task.FromResult(ans is "y" or "yes"
             ? ToolGateDecision.Allow
             : ToolGateDecision.Deny("the user declined this action"));
+    }
+}
+
+/// <summary>
+/// Wires the OpenTelemetry SDK to Ratchet's instrumentation (the <c>Ratchet.Agent</c>
+/// ActivitySource + Meter) and exports it. Off by default; <c>RATCHET_OTEL=console</c>
+/// prints spans/metrics to stdout, <c>otlp</c> ships them to an OTLP collector
+/// (Jaeger/Tempo/Grafana/…) at <c>OTEL_EXPORTER_OTLP_ENDPOINT</c> (default localhost:4317).
+/// The returned handle flushes pending exports on dispose.
+/// </summary>
+static class OTel
+{
+    public static IDisposable? Enable(string? mode, string serviceName)
+    {
+        mode = mode?.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(mode) || mode is "off" or "0" or "false" or "none") return null;
+        var console = mode is "console" or "stdout";
+
+        var resource = ResourceBuilder.CreateDefault().AddService(serviceName);
+        var tracer = Sdk.CreateTracerProviderBuilder().SetResourceBuilder(resource).AddSource(RatchetTelemetry.Name);
+        var meter = Sdk.CreateMeterProviderBuilder().SetResourceBuilder(resource).AddMeter(RatchetTelemetry.Name);
+        if (console) { tracer.AddConsoleExporter(); meter.AddConsoleExporter(); }
+        else { tracer.AddOtlpExporter(); meter.AddOtlpExporter(); }
+
+        var tp = tracer.Build();
+        var mp = meter.Build();
+        Console.Error.WriteLine(console
+            ? "[otel] exporting ratchet traces + metrics to the console"
+            : $"[otel] exporting ratchet traces + metrics via OTLP to {Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT") ?? "http://localhost:4317"}");
+        return new Handle(tp, mp);
+    }
+
+    private sealed class Handle : IDisposable
+    {
+        private readonly TracerProvider _tp;
+        private readonly MeterProvider _mp;
+        public Handle(TracerProvider tp, MeterProvider mp) { _tp = tp; _mp = mp; }
+        public void Dispose() { _tp.Dispose(); _mp.Dispose(); }   // dispose flushes pending exports
     }
 }

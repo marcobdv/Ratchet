@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using CodeStack.Ratchet.Core;
@@ -18,12 +19,15 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
     private readonly IChatClient _chat;
     private readonly string _model;
     private readonly int _maxTokens;
+    private readonly string _system;
 
-    public ChatClientLlm(IChatClient chat, string model, int maxTokens = 4096)
+    /// <param name="system">The <c>gen_ai.system</c> label for telemetry (anthropic, openai, openrouter, …).</param>
+    public ChatClientLlm(IChatClient chat, string model, int maxTokens = 4096, string system = "openai")
     {
         _chat = chat;
         _model = model;
         _maxTokens = maxTokens;
+        _system = system;
     }
 
     public async Task<LlmResponse> CompleteAsync(
@@ -40,6 +44,9 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
             MaxOutputTokens = _maxTokens,
             Tools = tools.Select(t => (AITool)new DeclarationFunction(t)).ToList(),
         };
+
+        using var span = RatchetTelemetry.StartChat(_system, _model);
+        var started = Stopwatch.GetTimestamp();
 
         var text = new StringBuilder();
         var toolCalls = new List<FunctionCallContent>();
@@ -76,6 +83,13 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
         }
 
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+
+        span?.SetTag("gen_ai.usage.input_tokens", inputTokens);
+        span?.SetTag("gen_ai.usage.output_tokens", outputTokens);
+        span?.SetTag("gen_ai.response.finish_reasons", new[] { stopReason });
+        RatchetTelemetry.RecordChat(_system, _model, (int)inputTokens, (int)outputTokens,
+            Stopwatch.GetElapsedTime(started).TotalSeconds, stopReason);
+
         return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, (int)inputTokens, (int)outputTokens);
     }
 

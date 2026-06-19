@@ -19,7 +19,9 @@ public sealed record WorkflowConfig(
     AdvisorSpec? DefaultAdvisor,
     SkillLoading SkillLoading,
     IReadOnlyList<PhaseSpec> Spine,
-    IReadOnlyDictionary<string, WorkTypeSpec> WorkTypes)
+    IReadOnlyDictionary<string, WorkTypeSpec> WorkTypes,
+    IReadOnlyList<string> DriverLadder,
+    bool RecordEscalations)
 {
     public PhaseSpec? Phase(string id) => Spine.FirstOrDefault(p => p.Id == id);
 
@@ -33,6 +35,27 @@ public sealed record WorkflowConfig(
     /// <summary>Floor (non-skippable) phase ids — the guarantees that no work_type may drop.</summary>
     public IReadOnlyList<string> FloorPhases =>
         Spine.Where(p => !p.Skippable).Select(p => p.Id).ToList();
+
+    /// <summary>
+    /// The PREDICTIVE layer: the starting tier for a phase, most specific first —
+    /// <c>work_type[phase].model → spine[phase].driver → defaults.driver</c>. Same key
+    /// (phase, work_type) the classifier already chose and skills already use; no second
+    /// router, no per-turn inference tax.
+    /// </summary>
+    public string StartingTier(WorkTypeSpec wt, string phaseId) =>
+        wt.ModelFor(phaseId) ?? Phase(phaseId)?.DriverTier ?? DefaultDriverTier;
+
+    /// <summary>
+    /// The REACTIVE layer's step: promote a tier one rung up <see cref="DriverLadder"/>.
+    /// Returns the same tier if it isn't on the ladder or is already at the top — so a
+    /// stuck phase keeps looping at the strongest driver rather than failing to promote.
+    /// </summary>
+    public string PromoteTier(string current)
+    {
+        for (var i = 0; i < DriverLadder.Count - 1; i++)
+            if (DriverLadder[i] == current) return DriverLadder[i + 1];
+        return current;
+    }
 }
 
 /// <summary>A named model tier. Phases reference the name, never the model — swap in one place.</summary>
@@ -80,10 +103,15 @@ public sealed record PhaseSpec(
 public sealed record WorkTypeSpec(
     string Name,
     IReadOnlyList<string> Phases,
-    IReadOnlyDictionary<string, IReadOnlyList<string>> Skills)
+    IReadOnlyDictionary<string, IReadOnlyList<string>> Skills,
+    IReadOnlyDictionary<string, string> Models,
+    bool Promote)
 {
     public IReadOnlyList<string> SkillsFor(string phaseId) =>
         Skills.TryGetValue(phaseId, out var s) ? s : Array.Empty<string>();
+
+    /// <summary>The per-phase starting-tier override for this work_type, or null to inherit.</summary>
+    public string? ModelFor(string phaseId) => Models.TryGetValue(phaseId, out var t) ? t : null;
 }
 
 /// <summary>Skill load policy: small eligible set → load all; larger → progressive disclosure.</summary>

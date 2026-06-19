@@ -1,11 +1,9 @@
 # Model selection / routing — follow-up feature
 
-> **Status:** follow-up feature, design only. Builds on
-> [`workflow-orchestration.md`](./workflow-orchestration.md) and **revises its
-> "Model tiers" section**: that section gives each phase one static `driver`;
-> this document refines model *selection* into a two-layer router. Don't
-> implement this until the base orchestration (spine, classifier, gates,
-> advisor) exists — it's a later rung, not a prerequisite.
+> **Status:** **implemented** in `src/Ratchet.Workflow` (v0.10), additive over
+> [`workflow-orchestration.md`](./workflow-orchestration.md). The design text below is
+> the rationale of record and is preserved unchanged; see **Implementation notes** at
+> the end for the code map and how the open forks were resolved.
 
 ## TL;DR
 
@@ -181,3 +179,48 @@ routing — failover, or cheapest-host-for-a-given-model (OpenRouter-style) — 
 different concern that lives *inside* a `models` tier's resolution and composes
 with everything above. It is not a substitute for, nor in tension with, the
 two-layer selection here.
+
+*(Provider routing shipped separately in v0.9.1 — `RATCHET_PROVIDER` selects Anthropic,
+OpenRouter, OpenAI, Groq, a local server, or any OpenAI-compatible endpoint, and a tier's
+`provider:` chooses per-tier. Orthogonal, exactly as noted here.)*
+
+## Implementation notes (v0.10 — `src/Ratchet.Workflow`)
+
+Additive over the base orchestration; no new component, no per-turn router — both layers
+reuse machinery that already existed.
+
+| Design piece | Code |
+|---|---|
+| Predictive resolution `work_type[phase].model → spine[phase].driver → defaults.driver` | `WorkflowConfig.StartingTier` |
+| Promotion ladder step | `WorkflowConfig.PromoteTier` over `defaults.driver_ladder` |
+| Per-phase override + per-work_type cap | `WorkTypeSpec.Models` / `WorkTypeSpec.Promote` |
+| Reactive promotion on a red gate | `WorkflowScheduler` — promote the re-running phase's `currentTier` |
+| Escalation telemetry | `run.Promotion(...)` events; `ratchet --routing-stats` aggregates per `(work_type, phase)` |
+| Loader rules | every ladder rung + every `work_type.models` value must resolve to a tier |
+
+The reactive step rides the **existing** loop-back: when a gate goes red and the scheduler
+re-runs a phase (whether `on_fail: loop` or `on_fail: <earlier phase>`), it promotes that
+phase's driver one rung before the re-run — bounded by the same `max_loops` and the ladder
+top. The promoted tier is part of the run checkpoint, so a resumed run continues at the
+tier it had climbed to. Cost already attributes per tier (the metered client), so a
+promotion shows up in the run's cost breakdown for free.
+
+**Open forks — resolved:**
+
+1. **Promote the driver, or re-frame first?** Promote the driver on the red-gate loop (the
+   cheap, in-place fix). The fresh-context *re-frame* stays a distinct path — the judge
+   gate's `fresh_context` and the `request_escalation` tool (escalation does **not**
+   promote). So both fixes exist and don't collide: gate-fail climbs the ladder; an
+   explicit escalation re-enters an earlier phase without changing tier.
+2. **Per-key cap.** A `work_type` sets `promote: false` to opt out of the cascade entirely
+   (e.g. `trivial` — a trivial task that keeps failing is a misclassification, not a
+   too-weak model). Clean boolean, no per-phase ceiling schema needed.
+3. **Telemetry granularity.** Shipped the minimum — per `(work_type, phase)` via
+   `--routing-stats`. Per-skill/per-repo is deferred until a real retune needs it.
+4. **Latency exception.** Not applicable: the target is batch/unattended, where the
+   failed-cheap-then-retry round trip is free, so the cascade wins outright (as argued).
+
+Verified by a deterministic harness (scripted `ILlmClient`): loader rejects bad ladder /
+override tiers, a per-`work_type` override sets the starting tier, a red gate promotes the
+driver one rung and logs the promotion, the promoted tier survives a resume, and
+`promote: false` loops without climbing.

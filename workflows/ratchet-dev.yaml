@@ -21,6 +21,7 @@ classifier:
 models:
   driver_cheap:     { provider: anthropic, model: claude-haiku-4-5-20251001 }
   driver_mid:       { provider: anthropic, model: claude-sonnet-4-6 }
+  driver_strong:    { provider: anthropic, model: claude-opus-4-8 }
   advisor_frontier: { provider: anthropic, model: claude-opus-4-8 }
   # Mix backends freely — provider can be anthropic | openrouter | openai | groq | local.
   # driver_local:   { provider: local,      model: qwen2.5-coder:14b }   # Ollama (RATCHET_LOCAL_BASE_URL)
@@ -28,6 +29,10 @@ models:
 
 defaults:
   driver: driver_cheap
+  # Reactive layer (model-routing.md): on a red gate, promote the re-running phase's
+  # driver one rung up this ladder instead of retrying at the same tier.
+  driver_ladder: [driver_cheap, driver_mid, driver_strong]
+  record_escalations: true        # emit per-(phase, work_type) escalation telemetry (--routing-stats)
   advisor:
     model: advisor_frontier
     consult_when: >
@@ -98,6 +103,8 @@ work_types:
   trivial:
     phases: [implement, verify, review]
     skills: {}
+    promote: false               # a trivial task that keeps failing is a misclassification,
+                                 # not a too-weak model — cap the cascade, don't climb the ladder
 
   small_change:
     phases: [plan, implement, verify, review, land]
@@ -110,3 +117,5 @@ work_types:
   bugfix:
     phases: [implement, verify, review]
     skills: {}
+    models:                      # PREDICTIVE override: bugfix-implement starts a rung up
+      implement: driver_mid      # (learned from telemetry — bugfixes rarely land on the cheap tier)

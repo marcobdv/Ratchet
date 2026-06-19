@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -41,6 +42,9 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         Action<string> onTextDelta,
         CancellationToken ct)
     {
+        using var span = RatchetTelemetry.StartChat("anthropic", _model);
+        var started = Stopwatch.GetTimestamp();
+
         var requestJson = BuildRequestJson(systemPrompt, conversation, tools);
         using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
         {
@@ -58,7 +62,14 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
 
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
-        return await ConsumeStreamAsync(reader, onTextDelta, ct);
+        var response = await ConsumeStreamAsync(reader, onTextDelta, ct);
+
+        span?.SetTag("gen_ai.usage.input_tokens", response.InputTokens);
+        span?.SetTag("gen_ai.usage.output_tokens", response.OutputTokens);
+        span?.SetTag("gen_ai.response.finish_reasons", new[] { response.StopReason });
+        RatchetTelemetry.RecordChat("anthropic", _model, response.InputTokens, response.OutputTokens,
+            Stopwatch.GetElapsedTime(started).TotalSeconds, response.StopReason);
+        return response;
     }
 
     // ---- request building -------------------------------------------------

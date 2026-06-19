@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using CodeStack.Ratchet.Core;
 
@@ -89,6 +90,10 @@ public sealed class WorkflowScheduler
     public async Task<WorkflowRun> RunAsync(string task, CancellationToken ct, RunSnapshot? resume)
     {
         _clients.Clear();
+        using var runSpan = RatchetTelemetry.Activity.StartActivity("workflow.run", ActivityKind.Internal);
+        runSpan?.SetTag("ratchet.workflow.name", _config.Name);
+        runSpan?.SetTag("ratchet.workflow.run_id", _runId);
+
         var run = new WorkflowRun(_runId, task, _echo);
         if (resume is not null)
             run.SeedFrom(resume.WorkType, resume.ClassifierReasoning, resume.Events, resume.Cost);
@@ -98,6 +103,7 @@ public sealed class WorkflowScheduler
         List<string> plan;
         int idx, escalations;
         Dictionary<string, int> loopCounts, attempt;
+        Dictionary<string, string> currentTier;   // reactive layer: each phase's promoted driver tier
         List<(string phase, string doc)> handoff;
         string? priorSession;
 
@@ -108,6 +114,7 @@ public sealed class WorkflowScheduler
             idx = resume.Idx;
             loopCounts = new Dictionary<string, int>(resume.LoopCounts, StringComparer.Ordinal);
             attempt = new Dictionary<string, int>(resume.Attempt, StringComparer.Ordinal);
+            currentTier = new Dictionary<string, string>(resume.CurrentTier, StringComparer.Ordinal);
             escalations = resume.Escalations;
             handoff = resume.Handoff.Select(h => (h.Phase, h.Doc)).ToList();
             priorSession = resume.PriorSession;
@@ -117,17 +124,23 @@ public sealed class WorkflowScheduler
             // Intake classifier — one judgment, recorded. Use the advisor tier if there is
             // one (highest-leverage call), else the default driver.
             var classifierTier = _config.DefaultAdvisor?.ModelTier ?? _config.DefaultDriverTier;
+            var clsSpan = RatchetTelemetry.Activity.StartActivity("classify", ActivityKind.Internal);
             var (wtName, reasoning) = await new Classifier(Client(classifierTier)).ClassifyAsync(task, _config, ct);
+            clsSpan?.SetTag("ratchet.work_type", wtName);
+            clsSpan?.Dispose();
             run.Classified(wtName, _config.RecordClassification ? reasoning : "(recording disabled)");
             workType = wtName;
             plan = new List<string>(_config.WorkTypes[workType].Phases);
             idx = 0; escalations = 0;
             loopCounts = new(StringComparer.Ordinal);
             attempt = new(StringComparer.Ordinal);
+            currentTier = new(StringComparer.Ordinal);
             handoff = new();
             priorSession = null;
         }
 
+        var wt = _config.WorkTypes[workType];
+        runSpan?.SetTag("ratchet.work_type", workType);
         var stepBudget = plan.Count * 6 + 16;   // backstop against any routing pathology
 
         void Checkpoint(string status) => _runStore?.Save(new RunSnapshot
@@ -140,6 +153,7 @@ public sealed class WorkflowScheduler
             Escalations = escalations,
             Handoff = handoff.Select(h => new HandoffEntry { Phase = h.phase, Doc = h.doc }).ToList(),
             PriorSession = priorSession,
+            CurrentTier = new Dictionary<string, string>(currentTier),
             Events = run.Events.ToList(),
             Cost = run.Cost,
         });
@@ -156,7 +170,12 @@ public sealed class WorkflowScheduler
             var phase = _config.Phase(phaseId)!;
             attempt[phaseId] = attempt.GetValueOrDefault(phaseId) + 1;
 
-            var result = await RunPhaseAsync(phase, workType, task, handoff, priorSession, run, ct);
+            // PREDICTIVE tier: pick the starting tier for (phase, work_type) the first time we
+            // enter this phase; thereafter the REACTIVE layer may have promoted it (below).
+            if (!currentTier.ContainsKey(phaseId)) currentTier[phaseId] = _config.StartingTier(wt, phaseId);
+            var driverTier = currentTier[phaseId];
+
+            var result = await RunPhaseAsync(phase, driverTier, workType, task, handoff, priorSession, run, ct);
 
             // Persist the phase transcript so the NEXT phase's `recall` can page into it.
             var sessionId = $"{_runId}.{phaseId}.{attempt[phaseId]}";
@@ -164,7 +183,7 @@ public sealed class WorkflowScheduler
             priorSession = sessionId;
 
             // Author the working-set handoff (v0.5 machinery) — also the judge gate's input.
-            var doc = await new HandoverGenerator(Client(phase.DriverTier))
+            var doc = await new HandoverGenerator(Client(driverTier))
                 .GenerateAsync(result.Conversation, null, ct);
             handoff.RemoveAll(h => h.phase == phaseId);
             handoff.Add((phaseId, doc));
@@ -201,6 +220,22 @@ public sealed class WorkflowScheduler
             if (loopCounts[phaseId] > phase.Gate.MaxLoops)
             { run.RunEnd(RunStatus.Failed, $"{phaseId} gate exceeded max_loops ({phase.Gate.MaxLoops})"); Checkpoint("failed"); return run; }
 
+            // REACTIVE promotion: a red gate means the work wasn't good enough, so promote the
+            // driver of the phase that re-runs one rung up the ladder rather than retry at the
+            // same tier (a stronger driver changes the work; consulting harder doesn't). Bounded
+            // by the same max_loops and the ladder top; a work_type may cap it with promote:false.
+            var promoteTarget = route == "loop" ? phaseId : route;
+            if (wt.Promote)
+            {
+                var from = currentTier.GetValueOrDefault(promoteTarget, _config.StartingTier(wt, promoteTarget));
+                var to = _config.PromoteTier(from);
+                if (to != from)
+                {
+                    currentTier[promoteTarget] = to;
+                    if (_config.RecordEscalations) run.Promotion(promoteTarget, from, to);
+                }
+            }
+
             if (route == "loop") continue;          // re-run the same phase
             RouteTo(plan, ref idx, route);          // re-enter a named earlier phase (e.g. verify -> implement)
         }
@@ -215,14 +250,19 @@ public sealed class WorkflowScheduler
     private sealed record PhaseResult(Conversation Conversation, ConsultState Consult, EscalationRequest Escalation);
 
     private async Task<PhaseResult> RunPhaseAsync(
-        PhaseSpec phase, string workType, string task,
+        PhaseSpec phase, string driverTier, string workType, string task,
         IReadOnlyList<(string phase, string doc)> handoff, string? priorSession,
         IWorkflowObserver run, CancellationToken ct)
     {
+        using var phaseSpan = RatchetTelemetry.Activity.StartActivity($"phase {phase.Id}", ActivityKind.Internal);
+        phaseSpan?.SetTag("ratchet.phase", phase.Id);
+        phaseSpan?.SetTag("ratchet.work_type", workType);
+        phaseSpan?.SetTag("ratchet.driver_tier", driverTier);
+
         var eligibleSkills = (_config.WorkTypes[workType]).SkillsFor(phase.Id);
         var loadAll = _config.SkillLoading.LoadAll(eligibleSkills.Count);
         var loadPolicy = eligibleSkills.Count == 0 ? "none" : loadAll ? "load_all" : _config.SkillLoading.StrategyAbove;
-        run.PhaseStart(phase.Id, phase.DriverTier, eligibleSkills, loadPolicy);
+        run.PhaseStart(phase.Id, driverTier, eligibleSkills, loadPolicy);
 
         var consult = new ConsultState
         {
@@ -238,7 +278,7 @@ public sealed class WorkflowScheduler
         var systemPrompt = BuildPhasePrompt(phase, task, handoff, eligibleSkills, loadAll);
         var tools = BuildPhaseTools(phase, conversation, consult, escalation, priorSession, run);
 
-        var agent = new Agent(Client(phase.DriverTier), new ToolRegistry(tools), systemPrompt, _agentObserver, _gate);
+        var agent = new Agent(Client(driverTier), new ToolRegistry(tools), systemPrompt, _agentObserver, _gate);
         await agent.RunTurnAsync(conversation, ct);
 
         return new PhaseResult(conversation, consult, escalation);
@@ -321,18 +361,24 @@ public sealed class WorkflowScheduler
 
     private async Task<GateOutcome> EvaluateGateAsync(PhaseSpec phase, string task, string doc, Conversation convo, CancellationToken ct)
     {
-        switch (phase.Gate.Type)
+        if (phase.Gate.Type == GateKind.None) return new GateOutcome(true, "");
+
+        using var gateSpan = RatchetTelemetry.Activity.StartActivity(
+            $"gate {phase.Gate.Type.ToString().ToLowerInvariant()}", ActivityKind.Internal);
+        gateSpan?.SetTag("ratchet.phase", phase.Id);
+
+        var outcome = phase.Gate.Type switch
         {
-            case GateKind.Command:
-                return await Gates.RunCommandAsync(phase.Gate.Run!, _shell, ct);
-            case GateKind.Judge:
-                var transcript = phase.Gate.FreshContext ? null : Flatten(convo);
-                return await Gates.RunJudgeAsync(
-                    Client(phase.Gate.ModelTier!), phase.Gate.JudgeAgent!, phase.Gate.FreshContext,
-                    task, doc, transcript, ct);
-            default:
-                return new GateOutcome(true, "");
-        }
+            GateKind.Command => await Gates.RunCommandAsync(phase.Gate.Run!, _shell, ct),
+            GateKind.Judge => await Gates.RunJudgeAsync(
+                Client(phase.Gate.ModelTier!), phase.Gate.JudgeAgent!, phase.Gate.FreshContext,
+                task, doc, phase.Gate.FreshContext ? null : Flatten(convo), ct),
+            _ => new GateOutcome(true, ""),
+        };
+
+        gateSpan?.SetTag("ratchet.gate.pass", outcome.Pass);
+        if (!outcome.Pass) gateSpan?.SetStatus(ActivityStatusCode.Error, "gate failed");
+        return outcome;
     }
 
     // ---- routing -----------------------------------------------------------

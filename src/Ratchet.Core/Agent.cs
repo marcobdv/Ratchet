@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace CodeStack.Ratchet.Core;
 
 /// <summary>
@@ -36,6 +38,7 @@ public sealed class Agent
     /// </summary>
     public async Task RunTurnAsync(Conversation conversation, CancellationToken ct)
     {
+        using var turn = RatchetTelemetry.StartTurn();
         while (true)
         {
             // Text streams out live through the observer; the assembled message
@@ -74,21 +77,33 @@ public sealed class Agent
         if (!_tools.TryGet(call.Name, out var tool))
             return ($"Unknown tool '{call.Name}'.", true);
 
+        using var span = RatchetTelemetry.StartTool(call.Name);
+        var started = Stopwatch.GetTimestamp();
+
         // Permission gate: a denial comes back as an error result the model can adapt
         // to, never an exception — the guarantee lives here, before the tool runs.
         var decision = await _gate.CheckAsync(call.Name, call.InputJson, ct);
         if (!decision.Allowed)
+        {
+            RatchetTelemetry.RecordGateDenial(call.Name);
+            span?.SetTag("ratchet.gate.denied", true);
+            span?.SetStatus(ActivityStatusCode.Error, "permission denied");
+            RatchetTelemetry.RecordTool(call.Name, error: true, Stopwatch.GetElapsedTime(started).TotalSeconds);
             return ($"Permission denied for '{call.Name}': {decision.Reason}", true);
+        }
 
         try
         {
             var result = await tool.ExecuteAsync(call.InputJson, ct);
+            RatchetTelemetry.RecordTool(call.Name, error: false, Stopwatch.GetElapsedTime(started).TotalSeconds);
             return (result, false);
         }
         catch (Exception ex)
         {
             // Tool failures are not agent failures: hand the error back to the
             // model as a result so it can recover, rather than crashing the loop.
+            span?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            RatchetTelemetry.RecordTool(call.Name, error: true, Stopwatch.GetElapsedTime(started).TotalSeconds);
             return ($"Tool '{call.Name}' threw: {ex.Message}", true);
         }
     }

@@ -36,6 +36,7 @@ public sealed class RunSnapshot
     public int Escalations { get; set; }
     public List<HandoffEntry> Handoff { get; set; } = new();
     public string? PriorSession { get; set; }
+    public Dictionary<string, string> CurrentTier { get; set; } = new();   // reactive-layer promotions
 
     // ---- recording ----
     public List<RunEvent> Events { get; set; } = new();

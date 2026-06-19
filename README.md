@@ -109,6 +109,27 @@ load?" is answerable). Inspect with `ratchet --runs` / `ratchet --run <id>`. An 
 run checkpoints after each phase and continues with `ratchet --workflow-resume <id>`. The
 full design and rationale is `docs/workflow-orchestration.md`.
 
+### Observability (OpenTelemetry)
+
+The agent is instrumented with OpenTelemetry — **off by default**, opt in with `RATCHET_OTEL`:
+
+```powershell
+$env:RATCHET_OTEL = "console"   # print spans + metrics to stdout
+$env:RATCHET_OTEL = "otlp"      # export to a collector (Jaeger/Tempo/Grafana/…)
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4317"   # otlp target (default)
+```
+
+It follows the OpenTelemetry **GenAI semantic conventions** (`gen_ai.*`), so any OTel
+backend renders it natively. **Traces** nest into a tree: `workflow.run → phase → agent.turn
+→ chat {model}` / `execute_tool {name}` / `gate {kind}` — with `gen_ai.system`,
+`gen_ai.request.model`, token usage, finish reason, and gate-denied flags on the spans.
+**Metrics**: `gen_ai.client.token.usage`, `gen_ai.client.operation.duration`,
+`ratchet.tool.calls` / `ratchet.tool.duration`, `ratchet.gate.denials`. The instrumentation
+lives in Core on the vendor-neutral BCL diagnostics API (`RatchetTelemetry`), so it's
+**zero-cost when nothing is listening** and Core takes no OpenTelemetry dependency — only the
+CLI wires the SDK + exporters, the same instrument-in-Core / configure-at-the-root seam as
+everything else.
+
 Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
 JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
 `.ratchet/ratchet.db` and inserts only new nodes per turn (no full rewrite).
@@ -141,6 +162,7 @@ tool to page detail back out of the prior session.
 | `Core/GitTools.cs` | `git_status` / `git_diff` — read-only repo awareness. |
 | `Core/FileAccessLog.cs` | The read-before-write guard shared by read/write/edit. |
 | `Core/WindowsPty.cs` | Opt-in ConPTY pseudo-console runner for `bash` (`RATCHET_PTY=1`). |
+| `Core/RatchetTelemetry.cs` | OpenTelemetry instrumentation (ActivitySource + Meter, GenAI conventions); SDK wired in the CLI. |
 
 `Cli/Program.cs` is wiring + a console observer + the REPL.
 `Storage.Sqlite/SqliteSessionStore.cs` is the optional SQLite backend.
@@ -288,6 +310,35 @@ still read-only by prompt, not by a gate.
 >   `RATCHET_BASE_URL` — all through the existing `ILlmClient` seam (`OpenAiChatClient` for the
 >   non-Anthropic wire). The same provider names work per-tier in a workflow, so one run can
 >   mix a cheap local driver with an OpenRouter frontier judge. See the provider table above.
+>
+> **v0.10 — two-layer model routing** (`docs/model-routing.md`). Not a separate router — the
+> orchestration already contained routing, in the form a coding agent wants:
+> - **Predictive.** A phase's starting model tier resolves `work_type[phase].model →
+>   spine[phase].driver → defaults.driver` — the same `(phase, work_type)` key the classifier
+>   already chose and skills already use. No per-turn router, no extra inference tax.
+> - **Reactive.** A `defaults.driver_ladder` turns the loop-back into a promotion: when a gate
+>   goes red and a phase re-runs, its driver climbs one rung (a stronger driver changes the
+>   work; consulting harder doesn't) — bounded by the same `max_loops` and the ladder top. A
+>   `work_type` opts out with `promote: false`. Escalation does **not** promote; it stays the
+>   distinct fresh-context re-frame.
+> - **Feedback loop.** Promotions are recorded per `(work_type, phase)`; `ratchet
+>   --routing-stats` aggregates the escalation rate across runs, so a cheap default that's wrong
+>   shows up as a high rate and is retuned with a one-line config diff — adaptation without a
+>   learned black box. Why two layers beat a router *on its own turf*: coding has ground truth a
+>   `dotnet test` away, so reacting to "did it pass" beats predicting "will it be hard", and the
+>   decision stays diffable. Rides the existing scheduler; the loop is untouched.
+>
+> **v0.11 — OpenTelemetry.** The agent is now observable. Instrumentation lives in Core on the
+> vendor-neutral BCL diagnostics API (`Core/RatchetTelemetry.cs`: one `ActivitySource` + one
+> `Meter`), so it's zero-cost when nothing listens and **Core keeps its no-dependency rule** —
+> only the CLI takes the OpenTelemetry SDK and wires exporters (`RATCHET_OTEL=console|otlp`).
+> Spans follow the GenAI semantic conventions and nest into a real trace tree — `workflow.run →
+> classify / phase → agent.turn → chat {model}` / `execute_tool {name}` / `gate {kind}` — with
+> `gen_ai.system`/`gen_ai.request.model`/token-usage/finish-reason/gate-denied attributes;
+> metrics cover token usage, model + tool durations, tool calls, and gate denials. The
+> LLM-client span sits where the model name is known (`ChatClientLlm`, `AnthropicClient`); the
+> turn/tool/gate spans in the loop; the run/phase/gate spans in the scheduler — each on the seam
+> it belongs to, the loop itself still untouched.
 
 ## Namespacing
 

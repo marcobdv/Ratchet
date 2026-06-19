@@ -18,6 +18,7 @@ public interface IWorkflowObserver
     void Consult(string phaseId, int n, int max, string advice);
     void Gate(string phaseId, string kind, string outcome, string reason);
     void Escalation(string fromPhase, string toPhase, string reason);
+    void Promotion(string phaseId, string fromTier, string toTier);
     void Conflict(string phaseId, string detail);
     void PhaseEnd(string phaseId, string summary);
     void RunEnd(RunStatus status, string reason);
@@ -91,6 +92,12 @@ public sealed class WorkflowRun : IWorkflowObserver
     {
         Add("escalation", fromPhase, $"-> {toPhase}: {Trunc(reason)}");
         _echo?.Escalation(fromPhase, toPhase, reason);
+    }
+
+    public void Promotion(string phaseId, string fromTier, string toTier)
+    {
+        Add("promote", phaseId, $"{fromTier} -> {toTier}");
+        _echo?.Promotion(phaseId, fromTier, toTier);
     }
 
     public void Conflict(string phaseId, string detail)

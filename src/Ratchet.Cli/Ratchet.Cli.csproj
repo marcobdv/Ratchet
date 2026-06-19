@@ -10,6 +10,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- OpenTelemetry SDK + exporters. Core/Llm/Workflow are instrumented with the
+         vendor-neutral BCL diagnostics API; only the CLI (the composition root) takes
+         the SDK dependency and wires exporters. Enabled at runtime via RATCHET_OTEL. -->
+    <PackageReference Include="OpenTelemetry" Version="1.12.0" />
+    <!-- NU1902: a moderate transitive (gRPC) advisory with no patched OTLP release yet.
+         Scoped-suppressed because this exporter is opt-in (RATCHET_OTEL=otlp) and targets a
+         localhost/trusted collector; revisit when a fixed version ships. -->
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.12.0" NoWarn="NU1902" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" Version="1.12.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
     <ProjectReference Include="..\Ratchet.Llm\Ratchet.Llm.csproj" />
     <ProjectReference Include="..\Ratchet.Storage.Sqlite\Ratchet.Storage.Sqlite.csproj" />

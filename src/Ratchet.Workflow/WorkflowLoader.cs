@@ -70,16 +70,23 @@ public static class WorkflowLoader
                 (kv.Value?.Skills ?? new()).ToDictionary(
                     s => s.Key,
                     s => (IReadOnlyList<string>)(s.Value ?? new List<string>()),
-                    StringComparer.Ordinal)),
+                    StringComparer.Ordinal),
+                (kv.Value?.Models ?? new()).ToDictionary(
+                    m => m.Key, m => m.Value ?? "", StringComparer.Ordinal),
+                kv.Value?.Promote ?? true),
             StringComparer.Ordinal);
 
         var skillLoading = new SkillLoading(
             dto.SkillLoading?.Threshold ?? 4,
             dto.SkillLoading?.StrategyAbove ?? "progressive");
 
+        // Promotion ladder (reactive layer). Unset = empty = no promotion (retry same tier).
+        var ladder = dto.Defaults?.DriverLadder ?? new List<string>();
+
         return new WorkflowConfig(
             dto.Version, dto.Name ?? "workflow", dto.Classifier?.Record ?? true,
-            models, defaultDriver, defaultAdvisor, skillLoading, spine, workTypes);
+            models, defaultDriver, defaultAdvisor, skillLoading, spine, workTypes,
+            ladder, dto.Defaults?.RecordEscalations ?? true);
     }
 
     private static AdvisorSpec? ResolvePhaseAdvisor(AdvisorDto? dto, AdvisorSpec? defaults)
@@ -167,6 +174,10 @@ public static class WorkflowLoader
                 if (!spineIds.Contains(t)) e.Add($"phase '{p.Id}' escalation target '{t}' is not a spine phase.");
         }
 
+        // Promotion ladder: every rung must resolve to a defined tier.
+        foreach (var t in c.DriverLadder)
+            if (!TierExists(t)) e.Add($"driver_ladder tier '{t}' is not a defined model.");
+
         var floors = new HashSet<string>(c.FloorPhases, StringComparer.Ordinal);
 
         // Rules 1 + 2, per work_type.
@@ -196,6 +207,15 @@ public static class WorkflowLoader
                         if (!knownSkills.Contains(s))
                             e.Add($"work_type '{name}' phase '{phaseId}' references unknown skill '{s}'.");
             }
+
+            // Predictive tier overrides: model keys are phases this work_type runs; values resolve.
+            foreach (var (phaseId, tier) in wt.Models)
+            {
+                if (!wt.Phases.Contains(phaseId))
+                    e.Add($"work_type '{name}' sets a model for phase '{phaseId}' which it does not run.");
+                if (!TierExists(tier))
+                    e.Add($"work_type '{name}' phase '{phaseId}' model '{tier}' is not a defined model.");
+            }
         }
         return e;
     }
@@ -216,7 +236,13 @@ public static class WorkflowLoader
 
     private sealed class ClassifierDto { public string? Output { get; set; } public bool Record { get; set; } = true; }
     private sealed class ModelDto { public string? Provider { get; set; } public string? Model { get; set; } }
-    private sealed class DefaultsDto { public string? Driver { get; set; } public AdvisorDto? Advisor { get; set; } }
+    private sealed class DefaultsDto
+    {
+        public string? Driver { get; set; }
+        public AdvisorDto? Advisor { get; set; }
+        public List<string>? DriverLadder { get; set; }
+        public bool? RecordEscalations { get; set; }
+    }
 
     private sealed class AdvisorDto
     {
@@ -256,5 +282,7 @@ public static class WorkflowLoader
     {
         public List<string>? Phases { get; set; }
         public Dictionary<string, List<string>>? Skills { get; set; }
+        public Dictionary<string, string>? Models { get; set; }   // phase -> starting tier
+        public bool? Promote { get; set; }                        // cap: false = never auto-promote
     }
 }
