@@ -124,10 +124,12 @@ public sealed class WorkflowScheduler
             // Intake classifier — one judgment, recorded. Use the advisor tier if there is
             // one (highest-leverage call), else the default driver.
             var classifierTier = _config.DefaultAdvisor?.ModelTier ?? _config.DefaultDriverTier;
-            var clsSpan = RatchetTelemetry.Activity.StartActivity("classify", ActivityKind.Internal);
-            var (wtName, reasoning) = await new Classifier(Client(classifierTier)).ClassifyAsync(task, _config, ct);
-            clsSpan?.SetTag("ratchet.work_type", wtName);
-            clsSpan?.Dispose();
+            string wtName, reasoning;
+            using (var clsSpan = RatchetTelemetry.Activity.StartActivity("classify", ActivityKind.Internal))
+            {
+                (wtName, reasoning) = await new Classifier(Client(classifierTier)).ClassifyAsync(task, _config, ct);
+                clsSpan?.SetTag("ratchet.work_type", wtName);
+            }
             run.Classified(wtName, _config.RecordClassification ? reasoning : "(recording disabled)");
             workType = wtName;
             plan = new List<string>(_config.WorkTypes[workType].Phases);
@@ -139,7 +141,13 @@ public sealed class WorkflowScheduler
             priorSession = null;
         }
 
-        var wt = _config.WorkTypes[workType];
+        // Guard the lookup: a resumed run whose config was edited (work_type renamed/removed)
+        // should fail gracefully here, not throw KeyNotFoundException mid-flight.
+        if (!_config.WorkTypes.TryGetValue(workType, out var wt))
+        {
+            run.RunEnd(RunStatus.Failed, $"work_type '{workType}' is not defined in this workflow (renamed or removed?).");
+            return run;
+        }
         runSpan?.SetTag("ratchet.work_type", workType);
         var stepBudget = plan.Count * 6 + 16;   // backstop against any routing pathology
 
@@ -232,7 +240,7 @@ public sealed class WorkflowScheduler
                 if (to != from)
                 {
                     currentTier[promoteTarget] = to;
-                    if (_config.RecordEscalations) run.Promotion(promoteTarget, from, to);
+                    if (_config.RecordPromotions) run.Promotion(promoteTarget, from, to);
                 }
             }
 
@@ -311,7 +319,10 @@ public sealed class WorkflowScheduler
                     var skill = _skills.Find(name);
                     if (skill is null) continue;
                     sb.Append("## ").Append(name).Append('\n');
-                    try { sb.Append(File.ReadAllText(skill.SkillFile)).Append("\n\n"); } catch { }
+                    // Don't silently drop a skill the prompt claims to apply: mark a read failure
+                    // so the gap is visible rather than an empty body the driver is told to follow.
+                    try { sb.Append(File.ReadAllText(skill.SkillFile)).Append("\n\n"); }
+                    catch (Exception ex) { sb.Append("(skill body unavailable: ").Append(ex.Message).Append(")\n\n"); }
                 }
             }
             else

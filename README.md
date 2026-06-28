@@ -121,7 +121,7 @@ $env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4317"   # otlp target (defa
 
 It follows the OpenTelemetry **GenAI semantic conventions** (`gen_ai.*`), so any OTel
 backend renders it natively. **Traces** nest into a tree: `workflow.run → phase → agent.turn
-→ chat {model}` / `execute_tool {name}` / `gate {kind}` — with `gen_ai.system`,
+→ chat {model}` / `execute_tool {name}` / `gate {kind}` — with `gen_ai.provider.name`,
 `gen_ai.request.model`, token usage, finish reason, and gate-denied flags on the spans.
 **Metrics**: `gen_ai.client.token.usage`, `gen_ai.client.operation.duration`,
 `ratchet.tool.calls` / `ratchet.tool.duration`, `ratchet.gate.denials`. The instrumentation
@@ -163,6 +163,8 @@ tool to page detail back out of the prior session.
 | `Core/FileAccessLog.cs` | The read-before-write guard shared by read/write/edit. |
 | `Core/WindowsPty.cs` | Opt-in ConPTY pseudo-console runner for `bash` (`RATCHET_PTY=1`). |
 | `Core/RatchetTelemetry.cs` | OpenTelemetry instrumentation (ActivitySource + Meter, GenAI conventions); SDK wired in the CLI. |
+| `Core/SearchTool.cs` | Read-only code search (regex + glob); the `explore` sub-agent's tool instead of a raw shell. |
+| `Core/ToolGate.cs` | `IToolGate` permission seam: `AllowAllGate` (default) and `ReadOnlyGate` (scopes delegated sub-agents). |
 
 `Cli/Program.cs` is wiring + a console observer + the REPL.
 `Storage.Sqlite/SqliteSessionStore.cs` is the optional SQLite backend.
@@ -191,8 +193,13 @@ self-authored summary, never a quiet lossy truncation. The **permission gate** t
 the conspicuous gap now exists (v0.9, `IToolGate`) but is **off by default** — Ratchet
 stays pi-plain YOLO unless you set `RATCHET_GATE=prompt` (or `deny`), at which point
 mutating tools (`bash`, `write`, `edit`, `git_commit`, `git_create_branch`, the Roslyn
-rename) require approval while read-only tools always pass. The `explore` sub-agent is
-still read-only by prompt, not by a gate.
+rename) require approval while read-only tools always pass.
+
+YOLO is for the *top-level* agent, which you drive directly — but a **delegated** sub-agent
+is scoped to its role regardless. The `explore` investigator now runs under a deny-by-default
+`ReadOnlyGate` with only read-only tools (`read` + a real read-only `search`), so it
+**cannot** mutate even if prompted to — the constraint is enforced in the loop, not asked for
+in its prompt.
 
 > **v0.1 — streaming.** Responses stream over SSE: assistant text appears
 > token-by-token, and tool-call arguments are reassembled from `input_json_delta`
@@ -334,7 +341,7 @@ still read-only by prompt, not by a gate.
 > only the CLI takes the OpenTelemetry SDK and wires exporters (`RATCHET_OTEL=console|otlp`).
 > Spans follow the GenAI semantic conventions and nest into a real trace tree — `workflow.run →
 > classify / phase → agent.turn → chat {model}` / `execute_tool {name}` / `gate {kind}` — with
-> `gen_ai.system`/`gen_ai.request.model`/token-usage/finish-reason/gate-denied attributes;
+> `gen_ai.provider.name`/`gen_ai.request.model`/token-usage/finish-reason/gate-denied attributes;
 > metrics cover token usage, model + tool durations, tool calls, and gate denials. The
 > LLM-client span sits where the model name is known (`ChatClientLlm`, `AnthropicClient`); the
 > turn/tool/gate spans in the loop; the run/phase/gate spans in the scheduler — each on the seam

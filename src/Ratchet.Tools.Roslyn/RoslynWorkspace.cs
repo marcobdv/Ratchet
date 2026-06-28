@@ -38,11 +38,16 @@ public sealed class RoslynWorkspace : IDisposable
     private readonly string _workingDirectory;
     private MSBuildWorkspace? _workspace;
     private string? _loadedTarget;
+    private string? _lastLoadWarning;
+    private long _loadedStamp;   // latest *.cs write-time at load, to skip rebuilds when nothing changed
 
     public RoslynWorkspace(string workingDirectory) => _workingDirectory = workingDirectory;
 
     public string WorkingDirectory => _workingDirectory;
     public string? LoadedTarget => _loadedTarget;
+
+    /// <summary>Non-fatal load problems from the most recent load (e.g. a project that failed to load), or null.</summary>
+    public string? LastLoadWarning => _lastLoadWarning;
 
     public async Task<(Solution? Solution, string? Error)> EnsureLoadedAsync(string? explicitPath, bool reload, CancellationToken ct)
     {
@@ -53,12 +58,28 @@ public sealed class RoslynWorkspace : IDisposable
             if (target is null)
                 return (null, "No .sln or .csproj found under the working directory. Pass an explicit project path.");
 
-            if (!reload && _workspace is not null && string.Equals(_loadedTarget, target, StringComparison.OrdinalIgnoreCase))
+            // Cache hit: same target, and either the caller didn't force a reload OR no source
+            // changed on disk since the last load. This stops roslyn_diagnostics (which asks for
+            // reload to stay fresh) from paying a multi-second MSBuild rebuild on every call when
+            // nothing actually changed.
+            var stamp = LatestSourceStamp(_workingDirectory);
+            if (_workspace is not null && string.Equals(_loadedTarget, target, StringComparison.OrdinalIgnoreCase)
+                && (!reload || stamp == _loadedStamp))
                 return (_workspace.CurrentSolution, null);
 
             _workspace?.Dispose();
             MsBuildBootstrap.Ensure();
             _workspace = MSBuildWorkspace.Create();
+
+            // MSBuildWorkspace reports most load problems (missing refs, SDK resolution,
+            // unsupported project types) via this event, NOT by throwing — so without it a
+            // partial load looks successful and tools run on an incomplete compilation.
+            var failures = new List<string>();
+            _workspace.WorkspaceFailed += (_, e) =>
+            {
+                if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+                    lock (failures) failures.Add(e.Diagnostic.Message);
+            };
 
             try
             {
@@ -73,10 +94,20 @@ public sealed class RoslynWorkspace : IDisposable
             }
 
             _loadedTarget = target;
+            _loadedStamp = stamp;
             var solution = _workspace.CurrentSolution;
-            return solution.Projects.Any()
-                ? (solution, null)
-                : (null, $"Loaded {Path.GetFileName(target)} but found no projects.");
+            string? warning;
+            lock (failures)
+                warning = failures.Count == 0
+                    ? null
+                    : $"{failures.Count} workspace load problem(s) — results may be incomplete:\n  - " +
+                      string.Join("\n  - ", failures.Take(20));
+            _lastLoadWarning = warning;
+
+            if (!solution.Projects.Any())
+                return (null, $"Loaded {Path.GetFileName(target)} but found no projects." +
+                              (warning is null ? "" : "\n" + warning));
+            return (solution, null);
         }
         finally
         {
@@ -85,6 +116,26 @@ public sealed class RoslynWorkspace : IDisposable
     }
 
     public bool TryApplyChanges(Solution solution) => _workspace?.TryApplyChanges(solution) ?? false;
+
+    /// <summary>Newest *.cs write-time under the dir (ignoring obj/bin). On error, returns "now" to force a reload.</summary>
+    private static long LatestSourceStamp(string dir)
+    {
+        try
+        {
+            long max = 0;
+            var skip = $"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}";
+            var skip2 = $"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}";
+            foreach (var f in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (f.Contains(skip, StringComparison.OrdinalIgnoreCase) || f.Contains(skip2, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var t = File.GetLastWriteTimeUtc(f).Ticks;
+                if (t > max) max = t;
+            }
+            return max;
+        }
+        catch { return DateTime.UtcNow.Ticks; }
+    }
 
     private static string? ResolveTarget(string workingDirectory, string? explicitPath)
     {

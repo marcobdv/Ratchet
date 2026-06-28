@@ -33,8 +33,13 @@ public sealed class ReadTool : ITool
     /// "known" so the edit tool will allow editing it (the read-before-write guard).</param>
     public ReadTool(FileAccessLog? access = null) => _access = access;
 
+    // Cap the returned text so one big file can't blow the context window (the whole
+    // transcript is re-sent every model call). Override with RATCHET_READ_MAX_BYTES.
+    private static readonly int MaxBytes =
+        int.TryParse(Environment.GetEnvironmentVariable("RATCHET_READ_MAX_BYTES"), out var m) && m > 0 ? m : 256 * 1024;
+
     public string Name => "read";
-    public string Description => "Read the full contents of a file at the given path.";
+    public string Description => "Read the full contents of a file at the given path (large files are truncated).";
     public string InputSchemaJson => """
         {"type":"object","properties":{"path":{"type":"string","description":"File path to read"}},"required":["path"]}
         """;
@@ -45,7 +50,10 @@ public sealed class ReadTool : ITool
         if (!File.Exists(path)) return $"No file at '{path}'.";
         var text = await File.ReadAllTextAsync(path, ct);
         _access?.MarkKnown(path);
-        return text.Length == 0 ? "(file is empty)" : text;
+        if (text.Length == 0) return "(file is empty)";
+        return text.Length <= MaxBytes
+            ? text
+            : text[..MaxBytes] + $"\n\n…(truncated: showing {MaxBytes} of {text.Length} chars)";
     }
 }
 
@@ -181,7 +189,9 @@ public sealed class BashTool : ITool
         {
             try
             {
-                var commandLine = $"{_shell.FileName} {_shell.CommandFlag} {command}";
+                // Quote the command as one argument so the shell flag (-c / -Command / /c)
+                // receives it intact — raw concatenation mangled commands with spaces/quotes.
+                var commandLine = $"{_shell.FileName} {_shell.CommandFlag} {QuoteArg(command)}";
                 var (exit, ptyOutput) = await WindowsPty.RunAsync(commandLine, ct);
                 // The command ran under the pty — trust its result and return it. We do
                 // NOT fall back to the Process path on empty output, because that would
@@ -199,28 +209,28 @@ public sealed class BashTool : ITool
             }
         }
 
-        var psi = new ProcessStartInfo
-        {
-            FileName = _shell.FileName,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
+        var psi = new ProcessStartInfo { FileName = _shell.FileName };
         psi.ArgumentList.Add(_shell.CommandFlag);
         psi.ArgumentList.Add(command);
 
-        using var proc = new Process { StartInfo = psi };
-        var output = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
+        var (exitCode, text) = await ProcessRunner.RunAsync(psi, ct);
+        return $"(exit {exitCode})\n{(text.Length == 0 ? "(no output)" : text)}";
+    }
 
-        proc.Start();
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-
-        var text = output.ToString();
-        return $"(exit {proc.ExitCode})\n{(text.Length == 0 ? "(no output)" : text)}";
+    /// <summary>Standard Windows argv quoting for a single argument (backslash + quote rules).</summary>
+    private static string QuoteArg(string s)
+    {
+        if (s.Length > 0 && s.IndexOfAny(new[] { ' ', '\t', '"', '\n' }) < 0) return s;
+        var sb = new StringBuilder("\"");
+        var slashes = 0;
+        foreach (var c in s)
+        {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') { sb.Append('\\', slashes * 2 + 1).Append('"'); slashes = 0; continue; }
+            if (slashes > 0) { sb.Append('\\', slashes); slashes = 0; }
+            sb.Append(c);
+        }
+        sb.Append('\\', slashes * 2).Append('"');
+        return sb.ToString();
     }
 }

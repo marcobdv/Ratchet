@@ -69,9 +69,9 @@ if (args.Contains("--routing-stats"))
             if (ev.Phase == "-") continue;
             var key = (wt, ev.Phase);
             var cur = agg.GetValueOrDefault(key);
-            if (ev.Kind == "phase_start") cur.starts++;
-            else if (ev.Kind == "promote") cur.promotes++;
-            else if (ev.Kind == "gate" && ev.Detail.Contains("fail")) cur.fails++;
+            if (ev.Kind == RunEventKind.PhaseStart) cur.starts++;
+            else if (ev.Kind == RunEventKind.Promote) cur.promotes++;
+            else if (ev.IsGateFailure) cur.fails++;   // structured outcome, not a reason-text substring
             agg[key] = cur;
         }
     }
@@ -167,12 +167,13 @@ var planTool = new PlanTool();
 var baseTools = new List<ITool>
 {
     new ReadTool(access), new WriteTool(access), new EditTool(access), new BashTool(shell, usePty),
+    new SearchTool(Directory.GetCurrentDirectory()),                        // read-only code search
     new SkillTool(skills), planTool,
     new TestTool(shell, Environment.GetEnvironmentVariable("RATCHET_TEST_CMD")),
 };
 baseTools.AddRange(GitTools.Build(Directory.GetCurrentDirectory()));        // git_status / git_diff (read-only)
 baseTools.AddRange(GitTools.BuildWrite(Directory.GetCurrentDirectory()));   // git_commit / git_create_branch (mutating → gated)
-baseTools.AddRange(SubAgents.Build(llm, shell));                            // explore sub-agent + advisors
+baseTools.AddRange(SubAgents.Build(llm));                                   // explore (read-only) + advisors
 
 // Roslyn semantic-C# tools (loads the workspace's solution/project on first use).
 using var roslyn = new RoslynToolset(Directory.GetCurrentDirectory());
@@ -302,7 +303,14 @@ Console.WriteLine(recallTool is not null
 
 // ---- the REPL: read a human line, run one agent turn, repeat --------------
 using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+var inTurn = false;
+Console.CancelKeyPress += (_, e) =>
+{
+    // During a turn: cancel it and suppress process kill. At the idle prompt: leave e.Cancel
+    // false so Ctrl+C falls through to default termination and actually quits — Console.ReadLine
+    // isn't cancellation-aware, so the token alone can't unblock the prompt.
+    if (inTurn) { e.Cancel = true; cts.Cancel(); }
+};
 
 while (!cts.IsCancellationRequested)
 {
@@ -329,6 +337,7 @@ while (!cts.IsCancellationRequested)
 
     try
     {
+        inTurn = true;
         await agent.RunTurnAsync(conversation, cts.Token);
 
         // Fold the new assistant/tool messages back into the tree as a chain,
@@ -346,9 +355,9 @@ while (!cts.IsCancellationRequested)
         }
 
         // Auto-compaction: once the context grows past the configured limit, fold it
-        // into a handover and continue in a fresh session seeded with that doc.
+        // into a handover and continue fresh. Pass the just-saved id so it isn't re-saved.
         if (contextLimit > 0 && observer.LastInputTokens >= contextLimit && tree.Count > 0)
-            await CompactAsync();
+            await CompactAsync(sessionId);
     }
     catch (OperationCanceledException)
     {
@@ -359,6 +368,10 @@ while (!cts.IsCancellationRequested)
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"[error] {ex.Message}");
         Console.ResetColor();
+    }
+    finally
+    {
+        inTurn = false;
     }
 
     Console.WriteLine();
@@ -405,7 +418,8 @@ async Task HandleCommandAsync(string input)
 
         case "/rewind":
             var n = 1;
-            if (arg.Length > 0 && !int.TryParse(arg, out n)) { Console.WriteLine("  usage: /rewind [n]"); break; }
+            if (arg.Length > 0 && !int.TryParse(arg, out n)) { Console.WriteLine("  usage: /rewind [n>=1]"); break; }
+            if (n < 1) { Console.WriteLine("  usage: /rewind [n>=1]"); break; }   // negative/0 would wipe the session
             tree.RewindTurns(n);
             if (tree.Count > 0) sessionId = store.Save(sessionId, tree);
             Console.WriteLine($"  rewound {n} turn(s) — head now {tree.HeadId ?? "(empty)"}. Continue to branch.");
@@ -466,9 +480,11 @@ async Task HandleCommandAsync(string input)
 // a cold store), author a handover from it, then continue in a FRESH session whose
 // system prompt carries that handover and whose `recall` searches the archived one —
 // the same machinery as `ratchet --handover`, applied in-process.
-async Task CompactAsync()
+async Task CompactAsync(string? alreadySavedId = null)
 {
-    var priorId = store.Save(sessionId, tree);
+    // The auto path passes the id it just persisted, so we don't write the unchanged tree
+    // twice; the manual /compact path passes null and we persist here.
+    var priorId = alreadySavedId ?? store.Save(sessionId, tree);
     Console.ForegroundColor = ConsoleColor.DarkCyan;
     Console.WriteLine($"\n  · context ~{observer.LastInputTokens} input tokens — compacting into a handover…\n");
     string doc;
@@ -793,7 +809,9 @@ static class OTel
         else { tracer.AddOtlpExporter(); meter.AddOtlpExporter(); }
 
         var tp = tracer.Build();
-        var mp = meter.Build();
+        MeterProvider mp;
+        try { mp = meter.Build(); }
+        catch { tp.Dispose(); throw; }   // don't leak the live tracer pipeline if the meter build fails
         Console.Error.WriteLine(console
             ? "[otel] exporting ratchet traces + metrics to the console"
             : $"[otel] exporting ratchet traces + metrics via OTLP to {Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT") ?? "http://localhost:4317"}");

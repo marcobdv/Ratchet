@@ -121,7 +121,7 @@ models:
 defaults:
   driver: driver_cheap
   driver_ladder: [driver_cheap, driver_mid, driver_strong]   # promotion order
-  record_escalations: true        # emit per-(phase, work_type) escalation telemetry
+  record_promotions: true         # emit per-(phase, work_type) promotion telemetry
 
 work_types:
   bugfix:
@@ -196,7 +196,12 @@ reuse machinery that already existed.
 | Per-phase override + per-work_type cap | `WorkTypeSpec.Models` / `WorkTypeSpec.Promote` |
 | Reactive promotion on a red gate | `WorkflowScheduler` — promote the re-running phase's `currentTier` |
 | Escalation telemetry | `run.Promotion(...)` events; `ratchet --routing-stats` aggregates per `(work_type, phase)` |
-| Loader rules | every ladder rung + every `work_type.models` value must resolve to a tier |
+| Loader rules | every ladder rung + every `work_type.models` value resolves to a tier; every runnable phase's starting tier is **on** the ladder (so promotion can climb) |
+
+The telemetry flag is `record_promotions` (`WorkflowConfig.RecordPromotions`) — it gates the
+recording of promotion events, which is what `--routing-stats` aggregates; it was renamed from
+the design's `record_escalations` because the code has a *separate*, always-recorded
+`run.Escalation` (the request-escalation re-frame), and the old name straddled both.
 
 The reactive step rides the **existing** loop-back: when a gate goes red and the scheduler
 re-runs a phase (whether `on_fail: loop` or `on_fail: <earlier phase>`), it promotes that

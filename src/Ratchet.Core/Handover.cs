@@ -90,7 +90,7 @@ public sealed class FileHandoverStore
     /// <summary>Write the handover; returns the file path.</summary>
     public string Save(Handover h)
     {
-        var path = Path.Combine(_dir, h.SourceSessionId + ".md");
+        var path = Path.Combine(_dir, SessionId.Validate(h.SourceSessionId) + ".md");
         var header = $"{HeaderTag} source={h.SourceSessionId} head={h.SourceHeadId ?? "-"} " +
                      $"created={h.CreatedUtc.ToString("o", CultureInfo.InvariantCulture)} -->";
         File.WriteAllText(path, header + "\n\n" + h.Content + "\n");
@@ -100,6 +100,7 @@ public sealed class FileHandoverStore
     /// <summary>Load by source-session id, or null if none. Tolerates a hand-edited body.</summary>
     public Handover? Load(string sourceId)
     {
+        if (!SessionId.IsValid(sourceId)) return null;
         var path = Path.Combine(_dir, sourceId + ".md");
         if (!File.Exists(path)) return null;
 

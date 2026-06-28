@@ -55,7 +55,9 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
 
     public string Save(string? id, SessionTree tree)
     {
-        id ??= DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        // Collision-resistant id (UTC + ms + random): a second-resolution local-time id could
+        // collide and silently merge two conversations under one PRIMARY KEY via ON CONFLICT.
+        id ??= SessionId.NewId();
 
         // Which nodes are already persisted? They're immutable, so we insert only
         // the ones we haven't seen — reading a few ids is far cheaper than
@@ -139,10 +141,16 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
     {
         BackfillFtsIfEmpty(sessionId);
         max = Math.Clamp(max, 1, 50);
-        var hits = new List<TextHit>(max);
+
+        // A query of pure FTS separators (e.g. "-", "()") tokenizes to an empty MATCH that
+        // silently matches nothing WITHOUT throwing — so the catch fallback never fires. Detect
+        // it up front and go straight to the LIKE scan, which a user would expect to match.
+        if (!query.Any(char.IsLetterOrDigit))
+            return LikeScan(sessionId, query, max);
 
         try
         {
+            var hits = new List<TextHit>(max);
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 SELECT node_id, role, snippet(nodes_fts, 3, '', '', '…', 16)
@@ -161,21 +169,27 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         }
         catch (SqliteException)
         {
-            // Degrade to a LIKE scan if FTS rejected the query for any reason.
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                SELECT node_id, role, body FROM nodes_fts
-                WHERE session_id = $s AND body LIKE $like
-                LIMIT $max;
-                """;
-            cmd.Parameters.AddWithValue("$s", sessionId);
-            cmd.Parameters.AddWithValue("$like", "%" + query + "%");
-            cmd.Parameters.AddWithValue("$max", max);
-            using var r = cmd.ExecuteReader();
-            while (r.Read())
-                hits.Add(new TextHit(r.GetString(0), ParseRole(r.GetString(1)), Snippet(r.GetString(2), query)));
-            return hits;
+            return LikeScan(sessionId, query, max);   // FTS rejected the query for some reason
         }
+    }
+
+    /// <summary>Plain substring scan — the fallback when FTS can't or won't match.</summary>
+    private List<TextHit> LikeScan(string sessionId, string query, int max)
+    {
+        var hits = new List<TextHit>(max);
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT node_id, role, body FROM nodes_fts
+            WHERE session_id = $s AND body LIKE $like
+            LIMIT $max;
+            """;
+        cmd.Parameters.AddWithValue("$s", sessionId);
+        cmd.Parameters.AddWithValue("$like", "%" + query + "%");
+        cmd.Parameters.AddWithValue("$max", max);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            hits.Add(new TextHit(r.GetString(0), ParseRole(r.GetString(1)), Snippet(r.GetString(2), query)));
+        return hits;
     }
 
     /// <summary>Index older sessions (rows written before the FTS table existed) on first search.</summary>
@@ -294,7 +308,9 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
-            var updated = DateTime.Parse(r.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+            // One malformed timestamp (hand-edited DB, older schema) shouldn't crash the whole
+            // session listing — fall back rather than throw.
+            DateTime.TryParse(r.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var updated);
             infos.Add(new SessionInfo(
                 r.GetString(0),
                 updated,

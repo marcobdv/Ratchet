@@ -20,31 +20,18 @@ public static class Gates
 {
     public static async Task<GateOutcome> RunCommandAsync(string command, ShellSpec shell, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = shell.FileName,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
+        var psi = new ProcessStartInfo { FileName = shell.FileName };
         psi.ArgumentList.Add(shell.CommandFlag);
         psi.ArgumentList.Add(command);
 
-        using var proc = new Process { StartInfo = psi };
-        var output = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-
-        try { proc.Start(); }
+        int exitCode;
+        string output;
+        try { (exitCode, output) = await ProcessRunner.RunAsync(psi, ct); }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex) { return new GateOutcome(false, $"could not run gate command: {ex.Message}"); }
 
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-
-        var tail = Tail(output.ToString(), 600);
-        return new GateOutcome(proc.ExitCode == 0, $"`{command}` exit {proc.ExitCode}{(tail.Length > 0 ? "\n" + tail : "")}");
+        var tail = Tail(output, 600);
+        return new GateOutcome(exitCode == 0, $"`{command}` exit {exitCode}{(tail.Length > 0 ? "\n" + tail : "")}");
     }
 
     /// <summary>

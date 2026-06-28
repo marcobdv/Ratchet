@@ -86,7 +86,7 @@ public static class WorkflowLoader
         return new WorkflowConfig(
             dto.Version, dto.Name ?? "workflow", dto.Classifier?.Record ?? true,
             models, defaultDriver, defaultAdvisor, skillLoading, spine, workTypes,
-            ladder, dto.Defaults?.RecordEscalations ?? true);
+            ladder, dto.Defaults?.RecordPromotions ?? true);
     }
 
     private static AdvisorSpec? ResolvePhaseAdvisor(AdvisorDto? dto, AdvisorSpec? defaults)
@@ -216,6 +216,29 @@ public static class WorkflowLoader
                 if (!TierExists(tier))
                     e.Add($"work_type '{name}' phase '{phaseId}' model '{tier}' is not a defined model.");
             }
+
+            // A gate's on_fail must route to a phase this work_type actually runs — otherwise a
+            // red gate would splice an omitted phase back in, violating the ordered-subset rule.
+            // (Escalation targets are intentionally allowed to be omitted phases — that's the
+            // documented "this proved bigger, re-enter an earlier phase" lever.)
+            foreach (var phaseId in wt.Phases)
+            {
+                var of = c.Phase(phaseId)?.Gate.OnFail;
+                if (of is not null && of != "loop" && of != "stop" && spineIds.Contains(of) && !wt.Phases.Contains(of))
+                    e.Add($"work_type '{name}' phase '{phaseId}' gate on_fail routes to '{of}', which this work_type does not run.");
+            }
+
+            // Reactive promotion can only climb if each runnable phase's starting tier is a rung on
+            // the ladder; otherwise a red gate would loop at the same model and fail silently.
+            if (wt.Promote && c.DriverLadder.Count > 0)
+                foreach (var phaseId in wt.Phases.Where(spineIds.Contains))
+                {
+                    var tier = c.StartingTier(wt, phaseId);
+                    if (TierExists(tier) && !c.DriverLadder.Contains(tier))
+                        e.Add($"work_type '{name}' phase '{phaseId}' starts on tier '{tier}', which is not on " +
+                              $"driver_ladder [{string.Join(", ", c.DriverLadder)}] — reactive promotion could never " +
+                              "climb from it. Add it to driver_ladder, change the starting tier, or set promote: false.");
+                }
         }
         return e;
     }
@@ -234,14 +257,14 @@ public static class WorkflowLoader
         public Dictionary<string, WorkTypeDto>? WorkTypes { get; set; }
     }
 
-    private sealed class ClassifierDto { public string? Output { get; set; } public bool Record { get; set; } = true; }
+    private sealed class ClassifierDto { public bool Record { get; set; } = true; }
     private sealed class ModelDto { public string? Provider { get; set; } public string? Model { get; set; } }
     private sealed class DefaultsDto
     {
         public string? Driver { get; set; }
         public AdvisorDto? Advisor { get; set; }
         public List<string>? DriverLadder { get; set; }
-        public bool? RecordEscalations { get; set; }
+        public bool? RecordPromotions { get; set; }
     }
 
     private sealed class AdvisorDto
@@ -270,7 +293,6 @@ public static class WorkflowLoader
     {
         public string? Type { get; set; }
         public string? Run { get; set; }
-        public string? PassOn { get; set; }
         public string? Agent { get; set; }
         public bool FreshContext { get; set; }
         public string? Model { get; set; }

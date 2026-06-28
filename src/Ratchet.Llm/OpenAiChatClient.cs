@@ -119,14 +119,16 @@ public sealed class OpenAiChatClient : IChatClient
         }
 
         var finalContents = new List<AIContent>();
-        foreach (var tb in toolBuilders.Values)
+        foreach (var (idx, tb) in toolBuilders)
         {
             if (string.IsNullOrEmpty(tb.Name)) continue;
             var args = tb.Args.Length == 0
                 ? new Dictionary<string, object?>()
                 : JsonSerializer.Deserialize<Dictionary<string, object?>>(tb.Args.ToString()) ?? new();
+            // Include the stream index in the synthesized id so two calls to the same tool in
+            // one turn (from a server that omits ids) don't collide on "call_<name>".
             finalContents.Add(new FunctionCallContent(
-                string.IsNullOrEmpty(tb.Id) ? "call_" + tb.Name : tb.Id, tb.Name, args));
+                string.IsNullOrEmpty(tb.Id) ? $"call_{idx}_{tb.Name}" : tb.Id, tb.Name, args));
         }
         finalContents.Add(new UsageContent(new UsageDetails
         {
@@ -214,7 +216,10 @@ public sealed class OpenAiChatClient : IChatClient
 
             w.WriteStartObject();
             w.WriteString("role", role);
-            w.WriteString("content", text);
+            // For a pure tool-call assistant turn, content must be null (not ""): strict
+            // OpenAI-compatible servers (vLLM/llama.cpp) reject empty content with tool_calls.
+            if (text.Length == 0 && toolCalls.Count > 0) w.WriteNull("content");
+            else w.WriteString("content", text);
             if (toolCalls.Count > 0)
             {
                 w.WriteStartArray("tool_calls");

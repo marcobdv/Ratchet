@@ -135,6 +135,27 @@ public interface ITextSearchableStore
 /// node with id + parent. Older v0.2 flat-list files still load (imported as a
 /// linear chain), so existing sessions aren't lost.
 /// </summary>
+/// <summary>
+/// Session id handling shared by the file + handover stores. Ids become file names, so an
+/// unvalidated id could escape the store dir ("../x", a rooted path) — Validate rejects that.
+/// NewId mints a collision-resistant id (UTC + ms + short random) so two sessions started in
+/// the same second can't overwrite each other (and ids don't jump on DST).
+/// </summary>
+public static class SessionId
+{
+    public static string NewId() =>
+        DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff") + "-" + Guid.NewGuid().ToString("N")[..4];
+
+    public static bool IsValid(string id) =>
+        !string.IsNullOrWhiteSpace(id) && id.Length <= 128
+        && !Path.IsPathRooted(id) && !id.Contains('/') && !id.Contains('\\')
+        && !id.Contains("..", StringComparison.Ordinal)
+        && id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+
+    public static string Validate(string id) =>
+        IsValid(id) ? id : throw new ArgumentException($"Invalid session id '{id}'.");
+}
+
 public sealed class FileSessionStore : ISessionStore
 {
     private readonly string _dir;
@@ -147,7 +168,7 @@ public sealed class FileSessionStore : ISessionStore
 
     public string Save(string? id, SessionTree tree)
     {
-        id ??= DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        id = id is null ? SessionId.NewId() : SessionId.Validate(id);
         var path = Path.Combine(_dir, id + ".json");
 
         var buffer = new ArrayBufferWriter<byte>();
@@ -177,6 +198,7 @@ public sealed class FileSessionStore : ISessionStore
 
     public SessionTree? Load(string id)
     {
+        if (!SessionId.IsValid(id)) return null;   // an unsafe id is simply "not found"
         var path = Path.Combine(_dir, id + ".json");
         if (!File.Exists(path)) return null;
 

@@ -48,49 +48,55 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
         using var span = RatchetTelemetry.StartChat(_system, _model);
         var started = Stopwatch.GetTimestamp();
 
-        var text = new StringBuilder();
-        var toolCalls = new List<FunctionCallContent>();
-        long inputTokens = 0, outputTokens = 0;
-
-        await foreach (var update in _chat.GetStreamingResponseAsync(messages, options, ct).ConfigureAwait(false))
+        try
         {
-            foreach (var content in update.Contents)
+            var text = new StringBuilder();
+            var toolCalls = new List<FunctionCallContent>();
+            long inputTokens = 0, outputTokens = 0;
+
+            await foreach (var update in _chat.GetStreamingResponseAsync(messages, options, ct).ConfigureAwait(false))
             {
-                switch (content)
+                foreach (var content in update.Contents)
                 {
-                    case TextContent t when t.Text.Length > 0:
-                        text.Append(t.Text);
-                        onTextDelta(t.Text);
-                        break;
-                    case FunctionCallContent call:
-                        toolCalls.Add(call);
-                        break;
-                    case UsageContent usage:
-                        inputTokens += usage.Details.InputTokenCount ?? 0;
-                        outputTokens += usage.Details.OutputTokenCount ?? 0;
-                        break;
+                    switch (content)
+                    {
+                        case TextContent t when t.Text.Length > 0:
+                            text.Append(t.Text);
+                            onTextDelta(t.Text);
+                            break;
+                        case FunctionCallContent call:
+                            toolCalls.Add(call);
+                            break;
+                        case UsageContent usage:
+                            inputTokens += usage.Details.InputTokenCount ?? 0;
+                            outputTokens += usage.Details.OutputTokenCount ?? 0;
+                            break;
+                    }
                 }
             }
-        }
 
-        var blocks = new List<ContentBlock>();
-        if (text.Length > 0)
-            blocks.Add(new TextBlock(text.ToString()));
-        foreach (var call in toolCalls)
+            var blocks = new List<ContentBlock>();
+            if (text.Length > 0)
+                blocks.Add(new TextBlock(text.ToString()));
+            foreach (var call in toolCalls)
+            {
+                var argsJson = JsonSerializer.Serialize(call.Arguments ?? new Dictionary<string, object?>());
+                blocks.Add(new ToolUseBlock(call.CallId, call.Name, argsJson));
+            }
+
+            var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+            RatchetTelemetry.RecordChatResult(span, _system, _model, (int)inputTokens, (int)outputTokens,
+                Stopwatch.GetElapsedTime(started).TotalSeconds, stopReason);
+
+            return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, (int)inputTokens, (int)outputTokens);
+        }
+        catch (Exception ex)
         {
-            var argsJson = JsonSerializer.Serialize(call.Arguments ?? new Dictionary<string, object?>());
-            blocks.Add(new ToolUseBlock(call.CallId, call.Name, argsJson));
+            // A failed model call must not look like a successful span (else error/latency
+            // dashboards under-report). Record the failed call and rethrow.
+            RatchetTelemetry.RecordChatError(span, _system, _model, Stopwatch.GetElapsedTime(started).TotalSeconds, ex);
+            throw;
         }
-
-        var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
-
-        span?.SetTag("gen_ai.usage.input_tokens", inputTokens);
-        span?.SetTag("gen_ai.usage.output_tokens", outputTokens);
-        span?.SetTag("gen_ai.response.finish_reasons", new[] { stopReason });
-        RatchetTelemetry.RecordChat(_system, _model, (int)inputTokens, (int)outputTokens,
-            Stopwatch.GetElapsedTime(started).TotalSeconds, stopReason);
-
-        return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, (int)inputTokens, (int)outputTokens);
     }
 
     // ---- Ratchet transcript -> M.E.AI messages ----------------------------
@@ -105,8 +111,12 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
             var toolResults = msg.Content.OfType<ToolResultBlock>().ToList();
             if (toolResults.Count > 0)
             {
+                // M.E.AI's FunctionResultContent has no error flag, and the downstream
+                // tool_result blocks never carry is_error on this path — so mark failures
+                // in the content itself, otherwise the model is told every tool succeeded.
                 var contents = toolResults
-                    .Select(r => (AIContent)new FunctionResultContent(r.ToolUseId, r.Content))
+                    .Select(r => (AIContent)new FunctionResultContent(
+                        r.ToolUseId, r.IsError ? "[tool error] " + r.Content : r.Content))
                     .ToList();
                 messages.Add(new ChatMessage(ChatRole.Tool, contents));
                 continue;

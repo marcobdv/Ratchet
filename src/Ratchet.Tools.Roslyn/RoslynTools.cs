@@ -87,23 +87,29 @@ internal sealed class DiagnosticsTool(RoslynWorkspace ws) : RoslynToolBase(ws)
         var (solution, error) = await Workspace.EnsureLoadedAsync(string.IsNullOrWhiteSpace(project) ? null : project, reload: true, ct);
         if (solution is null) return $"Error: {error}";
 
-        var sb = new StringBuilder();
-        int errors = 0, warnings = 0;
+        // Collect across ALL projects first, then order globally — otherwise the per-project
+        // 200-row cap could spend the budget on one project's warnings and drop another's errors
+        // from the listing while still counting them.
+        var all = new List<Diagnostic>();
         foreach (var proj in solution.Projects)
         {
             var compilation = await proj.GetCompilationAsync(ct);
             if (compilation is null) continue;
-            foreach (var diag in compilation.GetDiagnostics(ct)
-                         .Where(d => d.Severity >= DiagnosticSeverity.Warning && d.Location.IsInSource)
-                         .OrderByDescending(d => d.Severity))
-            {
-                if (diag.Severity == DiagnosticSeverity.Error) errors++; else warnings++;
-                if (errors + warnings <= 200)
-                    sb.AppendLine($"{diag.Severity.ToString().ToLowerInvariant()} {diag.Id} {Loc(diag.Location)}: {diag.GetMessage()}");
-            }
+            all.AddRange(compilation.GetDiagnostics(ct)
+                .Where(d => d.Severity >= DiagnosticSeverity.Warning && d.Location.IsInSource));
         }
 
-        if (errors + warnings == 0) return $"No errors or warnings in {Path.GetFileName(Workspace.LoadedTarget!)}.";
+        var errors = all.Count(d => d.Severity == DiagnosticSeverity.Error);
+        var warnings = all.Count - errors;
+
+        var sb = new StringBuilder();
+        if (Workspace.LastLoadWarning is { } warn) sb.AppendLine(warn);   // partial-load diagnostics
+        foreach (var diag in all.OrderByDescending(d => d.Severity).Take(200))
+            sb.AppendLine($"{diag.Severity.ToString().ToLowerInvariant()} {diag.Id} {Loc(diag.Location)}: {diag.GetMessage()}");
+
+        if (errors + warnings == 0)
+            return (Workspace.LastLoadWarning is null ? "" : Workspace.LastLoadWarning + "\n") +
+                   $"No errors or warnings in {Path.GetFileName(Workspace.LoadedTarget!)}.";
         return $"{errors} error(s), {warnings} warning(s) in {Path.GetFileName(Workspace.LoadedTarget!)}:\n{sb}";
     }
 }

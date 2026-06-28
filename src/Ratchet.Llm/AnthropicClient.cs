@@ -45,31 +45,38 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         using var span = RatchetTelemetry.StartChat("anthropic", _model);
         var started = Stopwatch.GetTimestamp();
 
-        var requestJson = BuildRequestJson(systemPrompt, conversation, tools);
-        using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
+        try
         {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
-        };
+            var requestJson = BuildRequestJson(systemPrompt, conversation, tools);
+            using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
+            {
+                Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
+            };
 
-        // ResponseHeadersRead: start reading the body as it arrives instead of
-        // buffering the whole response — that's what makes streaming "live".
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-        if (!resp.IsSuccessStatusCode)
-        {
-            var err = await resp.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {err}");
+            // ResponseHeadersRead: start reading the body as it arrives instead of
+            // buffering the whole response — that's what makes streaming "live".
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var err = await resp.Content.ReadAsStringAsync(ct);
+                throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {err}");
+            }
+
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            using var reader = new StreamReader(stream);
+            var response = await ConsumeStreamAsync(reader, onTextDelta, ct);
+
+            RatchetTelemetry.RecordChatResult(span, "anthropic", _model, response.InputTokens, response.OutputTokens,
+                Stopwatch.GetElapsedTime(started).TotalSeconds, response.StopReason);
+            return response;
         }
-
-        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
-        using var reader = new StreamReader(stream);
-        var response = await ConsumeStreamAsync(reader, onTextDelta, ct);
-
-        span?.SetTag("gen_ai.usage.input_tokens", response.InputTokens);
-        span?.SetTag("gen_ai.usage.output_tokens", response.OutputTokens);
-        span?.SetTag("gen_ai.response.finish_reasons", new[] { response.StopReason });
-        RatchetTelemetry.RecordChat("anthropic", _model, response.InputTokens, response.OutputTokens,
-            Stopwatch.GetElapsedTime(started).TotalSeconds, response.StopReason);
-        return response;
+        catch (Exception ex)
+        {
+            // A failed call (non-2xx, network drop, parse error) must surface on the span and
+            // the duration metric, not look successful — else error/latency dashboards under-report.
+            RatchetTelemetry.RecordChatError(span, "anthropic", _model, Stopwatch.GetElapsedTime(started).TotalSeconds, ex);
+            throw;
+        }
     }
 
     // ---- request building -------------------------------------------------
@@ -229,9 +236,12 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
             {
                 case "message_start":
                     if (root.TryGetProperty("message", out var m) &&
-                        m.TryGetProperty("usage", out var u0) &&
-                        u0.TryGetProperty("input_tokens", out var it))
-                        inputTokens = it.GetInt32();
+                        m.TryGetProperty("usage", out var u0))
+                        // Anthropic reports the cached portions separately; include them so
+                        // input-token accounting reflects actual billed input (caching is always on).
+                        inputTokens = UsageInt(u0, "input_tokens")
+                                    + UsageInt(u0, "cache_creation_input_tokens")
+                                    + UsageInt(u0, "cache_read_input_tokens");
                     break;
 
                 case "content_block_start":
@@ -299,6 +309,9 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
 
         return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, inputTokens, outputTokens);
     }
+
+    private static int UsageInt(JsonElement usage, string prop) =>
+        usage.TryGetProperty(prop, out var v) && v.TryGetInt32(out var n) ? n : 0;
 
     /// <summary>Accumulates one streamed content block across its delta events.</summary>
     private sealed class BlockBuilder

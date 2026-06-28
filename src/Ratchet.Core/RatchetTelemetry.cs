@@ -45,7 +45,7 @@ public static class RatchetTelemetry
     {
         var a = Activity.StartActivity($"chat {model}", ActivityKind.Client);
         a?.SetTag("gen_ai.operation.name", "chat");
-        a?.SetTag("gen_ai.system", system);
+        a?.SetTag("gen_ai.provider.name", system);   // gen_ai.system is deprecated in the conventions
         a?.SetTag("gen_ai.request.model", model);
         return a;
     }
@@ -61,23 +61,63 @@ public static class RatchetTelemetry
 
     // ---- metric recording --------------------------------------------------
 
-    /// <summary>Record token usage + duration for one model call, tagged per GenAI conventions.</summary>
-    public static void RecordChat(string system, string model, int inputTokens, int outputTokens, double seconds, string finishReason)
+    /// <summary>
+    /// Finalize a successful chat span: stamp the GenAI usage/finish tags AND record the
+    /// metrics. Shared by every LLM client so the span shape can't drift between providers.
+    /// </summary>
+    public static void RecordChatResult(Activity? span, string system, string model,
+        int inputTokens, int outputTokens, double seconds, string finishReason)
     {
-        var sys = new KeyValuePair<string, object?>("gen_ai.system", system);
-        var mod = new KeyValuePair<string, object?>("gen_ai.request.model", model);
-        var op = new KeyValuePair<string, object?>("gen_ai.operation.name", "chat");
-        TokenUsage.Record(inputTokens, sys, mod, op, new("gen_ai.token.type", "input"));
-        TokenUsage.Record(outputTokens, sys, mod, op, new("gen_ai.token.type", "output"));
-        OpDuration.Record(seconds, sys, mod, op, new("gen_ai.response.finish_reason", finishReason));
+        span?.SetTag("gen_ai.usage.input_tokens", inputTokens);
+        span?.SetTag("gen_ai.usage.output_tokens", outputTokens);
+        span?.SetTag("gen_ai.response.finish_reasons", new[] { finishReason });   // span only; not a metric dim
+        RecordChat(system, model, inputTokens, outputTokens, seconds, null);
     }
 
-    public static void RecordTool(string toolName, bool error, double seconds)
+    /// <summary>Mark a span failed with the exception message (span only, no metric).</summary>
+    public static void Fail(Activity? span, Exception ex) => span?.SetStatus(ActivityStatusCode.Error, ex.Message);
+
+    /// <summary>
+    /// Finalize a FAILED chat call: mark the span and record the duration metric with an
+    /// error.type, so error-rate and latency dashboards see failures (not just successes).
+    /// Call in a catch before rethrowing.
+    /// </summary>
+    public static void RecordChatError(Activity? span, string system, string model, double seconds, Exception ex)
+    {
+        span?.SetStatus(ActivityStatusCode.Error, ex.Message);
+        RecordChat(system, model, null, null, seconds, ex.GetType().Name);
+    }
+
+    /// <summary>
+    /// Record duration (always) and token usage (when known) for one model call, tagged per
+    /// GenAI conventions. <paramref name="errorType"/> is null on success, else the error.type.
+    /// </summary>
+    private static void RecordChat(string system, string model, int? inputTokens, int? outputTokens, double seconds, string? errorType)
+    {
+        var prov = new KeyValuePair<string, object?>("gen_ai.provider.name", system);
+        var mod = new KeyValuePair<string, object?>("gen_ai.request.model", model);
+        var op = new KeyValuePair<string, object?>("gen_ai.operation.name", "chat");
+        if (inputTokens is int it) TokenUsage.Record(it, prov, mod, op, new("gen_ai.token.type", "input"));
+        if (outputTokens is int ot) TokenUsage.Record(ot, prov, mod, op, new("gen_ai.token.type", "output"));
+        if (errorType is null) OpDuration.Record(seconds, prov, mod, op);
+        else OpDuration.Record(seconds, prov, mod, op, new("error.type", errorType));
+    }
+
+    /// <param name="errorType">null on success; otherwise the conventional error.type (e.g. exception name).</param>
+    public static void RecordTool(string toolName, string? errorType, double seconds)
     {
         var name = new KeyValuePair<string, object?>("gen_ai.tool.name", toolName);
-        var err = new KeyValuePair<string, object?>("error", error);
-        ToolCalls.Add(1, name, err);
-        ToolDuration.Record(seconds, name, err);
+        if (errorType is null)
+        {
+            ToolCalls.Add(1, name);
+            ToolDuration.Record(seconds, name);
+        }
+        else
+        {
+            var err = new KeyValuePair<string, object?>("error.type", errorType);
+            ToolCalls.Add(1, name, err);
+            ToolDuration.Record(seconds, name, err);
+        }
     }
 
     public static void RecordGateDenial(string toolName) =>

@@ -17,14 +17,19 @@ public sealed class DelegateTool : ITool
     private readonly ILlmClient _llm;
     private readonly string _systemPrompt;
     private readonly IReadOnlyList<ITool> _tools;
+    private readonly IToolGate _gate;
 
-    public DelegateTool(string name, string description, string systemPrompt, ILlmClient llm, IReadOnlyList<ITool> tools)
+    /// <param name="gate">Scopes the delegate to its role — e.g. a <see cref="ReadOnlyGate"/> for an
+    /// investigator. Defaults to <see cref="AllowAllGate"/> (the nested agent is as free as the parent).</param>
+    public DelegateTool(string name, string description, string systemPrompt, ILlmClient llm,
+        IReadOnlyList<ITool> tools, IToolGate? gate = null)
     {
         Name = name;
         Description = description;
         _systemPrompt = systemPrompt;
         _llm = llm;
         _tools = tools;
+        _gate = gate ?? AllowAllGate.Instance;
     }
 
     public string Name { get; }
@@ -42,7 +47,7 @@ public sealed class DelegateTool : ITool
         conversation.Add(Message.UserText(task));
 
         var registry = new ToolRegistry(_tools);
-        var agent = new Agent(_llm, registry, _systemPrompt, NullObserver.Instance);
+        var agent = new Agent(_llm, registry, _systemPrompt, NullObserver.Instance, _gate);
         await agent.RunTurnAsync(conversation, ct);
 
         var text = LastAssistantText(conversation);
@@ -67,17 +72,19 @@ public sealed class DelegateTool : ITool
 /// <summary>Builds Ratchet's delegation tools: one investigative sub-agent and three advisors.</summary>
 public static class SubAgents
 {
-    public static IEnumerable<ITool> Build(ILlmClient llm, ShellSpec shell)
+    public static IEnumerable<ITool> Build(ILlmClient llm)
     {
-        // The explorer investigates; it gets read plus the shell (for grep/find/dir). Ratchet is
-        // YOLO by design, so the read-only discipline lives in the prompt, not a permission gate.
-        IReadOnlyList<ITool> exploreTools = [new ReadTool(), new BashTool(shell)];
+        // The explorer investigates and must not mutate anything. Even though the top-level agent
+        // is YOLO by design, a *delegated* agent is scoped to its role: it gets only read-only
+        // tools (read + search), and a ReadOnlyGate enforces that in the loop so the constraint
+        // can't be prompted around — no raw shell, no write/edit.
+        IReadOnlyList<ITool> exploreTools = [new ReadTool(), new SearchTool()];
         yield return new DelegateTool(
             "explore",
-            "Delegate a focused investigation of the codebase to a sub-agent. Input: a clear question " +
-            "plus any context (it does not see this conversation). It reads files and uses the shell to " +
-            "search, then returns findings. Use it to investigate without filling your own context.",
-            ExplorerPrompt, llm, exploreTools);
+            "Delegate a focused, READ-ONLY investigation of the codebase to a sub-agent. Input: a clear " +
+            "question plus any context (it does not see this conversation). It reads files and searches " +
+            "code, then returns findings. Use it to investigate without filling your own context.",
+            ExplorerPrompt, llm, exploreTools, gate: new ReadOnlyGate());
 
         yield return new DelegateTool(
             "security_advisor",
@@ -101,10 +108,11 @@ public static class SubAgents
     }
 
     private const string ExplorerPrompt =
-        "You are an exploration sub-agent. Investigate the codebase to answer the given question. " +
-        "You have a read tool and a shell — use the shell only for read-only search (grep/find/dir/Get-ChildItem), " +
-        "do not modify anything. Find the relevant code, then return a concise findings report: the answer, the " +
-        "key locations as file:line, and how the pieces fit. Cite locations; don't speculate beyond what you found.";
+        "You are a read-only exploration sub-agent. Investigate the codebase to answer the given question " +
+        "using the `read` and `search` tools (search does regex content search and filename globbing). You " +
+        "cannot modify anything — that's enforced. Find the relevant code, then return a concise findings " +
+        "report: the answer, the key locations as file:line, and how the pieces fit. Cite locations; don't " +
+        "speculate beyond what you found.";
 
     private const string SecurityPrompt =
         "You are a security advisor giving a focused second opinion. You have no tools; reason only about what is " +

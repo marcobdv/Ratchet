@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodeStack.Ratchet.Core;
 
 namespace CodeStack.Ratchet.Workflow;
@@ -72,10 +73,13 @@ public sealed class Classifier
             catch { /* fall through to token scan */ }
         }
 
-        // Last resort: did the model just name a work_type in prose?
-        foreach (var name in config.WorkTypes.Keys)
-            if (raw.Contains(name, StringComparison.OrdinalIgnoreCase))
-            { workType = name; reasoning = "(parsed work_type from prose)"; return true; }
+        // Last resort: did the model name a work_type in prose? Match on word boundaries (so
+        // "fix" doesn't hit inside "bugfix") and only accept an UNambiguous single match — if
+        // zero or several names appear, return false so the caller sizes up to MostThorough.
+        var named = config.WorkTypes.Keys
+            .Where(name => Regex.IsMatch(raw, $@"\b{Regex.Escape(name)}\b", RegexOptions.IgnoreCase))
+            .ToList();
+        if (named.Count == 1) { workType = named[0]; reasoning = "(parsed work_type from prose)"; return true; }
         return false;
     }
 

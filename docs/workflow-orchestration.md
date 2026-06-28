@@ -472,3 +472,8 @@ command-gate loop-back → escalation, alongside the four loader-validation rule
 These are verified by a second deterministic harness (gate allow/deny in the loop, run
 store roundtrip, cost tally across a full run, interrupt → checkpoint → resume, and a
 real `git_commit` both succeeding and being blocked by a deny gate).
+
+**Note on `pass_on`.** The illustrative gate YAML above shows `pass_on: exit_zero`, but the
+implementation only ever passes a command gate on exit 0, so `pass_on` was a no-op and has
+been dropped from the schema (the loader no longer reads it). A command gate = "exit 0 is
+pass"; if a non-zero expected code is ever needed, that's a real feature to add, not a label.

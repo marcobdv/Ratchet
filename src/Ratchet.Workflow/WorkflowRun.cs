@@ -3,7 +3,28 @@ namespace CodeStack.Ratchet.Workflow;
 public enum RunStatus { Running, Completed, Failed }
 
 /// <summary>One recorded event in a run's trace (classification, skip, gate, consult, conflict…).</summary>
-public sealed record RunEvent(string Kind, string Phase, string Detail);
+public sealed record RunEvent(string Kind, string Phase, string Detail)
+{
+    /// <summary>True for a gate event whose outcome was a failure (parsed from the recorded detail).</summary>
+    public bool IsGateFailure => Kind == RunEventKind.Gate && Detail.Contains(" -> fail", StringComparison.Ordinal);
+}
+
+/// <summary>
+/// The event-kind vocabulary, shared between the recorder (<see cref="WorkflowRun"/>) and any
+/// reader (e.g. <c>--routing-stats</c>) so the two don't drift via duplicated magic strings.
+/// </summary>
+public static class RunEventKind
+{
+    public const string Classified = "classified";
+    public const string PhaseStart = "phase_start";
+    public const string Consult = "consult";
+    public const string Gate = "gate";
+    public const string Escalation = "escalation";
+    public const string Promote = "promote";
+    public const string Conflict = "conflict";
+    public const string PhaseEnd = "phase_end";
+    public const string RunEnd = "run_end";
+}
 
 /// <summary>
 /// Run-level recording seam. The single highest-leverage judgment (classification)
@@ -66,56 +87,56 @@ public sealed class WorkflowRun : IWorkflowObserver
     public void Classified(string workType, string reasoning)
     {
         WorkType = workType; ClassifierReasoning = reasoning;
-        Add("classified", "-", $"{workType}: {reasoning}");
+        Add(RunEventKind.Classified, "-", $"{workType}: {reasoning}");
         _echo?.Classified(workType, reasoning);
     }
 
     public void PhaseStart(string phaseId, string driverTier, IReadOnlyList<string> skills, string loadPolicy)
     {
-        Add("phase_start", phaseId, $"driver={driverTier} skills=[{string.Join(", ", skills)}] load={loadPolicy}");
+        Add(RunEventKind.PhaseStart, phaseId, $"driver={driverTier} skills=[{string.Join(", ", skills)}] load={loadPolicy}");
         _echo?.PhaseStart(phaseId, driverTier, skills, loadPolicy);
     }
 
     public void Consult(string phaseId, int n, int max, string advice)
     {
-        Add("consult", phaseId, $"{n}/{max}: {Trunc(advice)}");
+        Add(RunEventKind.Consult, phaseId, $"{n}/{max}: {Trunc(advice)}");
         _echo?.Consult(phaseId, n, max, advice);
     }
 
     public void Gate(string phaseId, string kind, string outcome, string reason)
     {
-        Add("gate", phaseId, $"{kind} -> {outcome}{(reason.Length > 0 ? ": " + Trunc(reason) : "")}");
+        Add(RunEventKind.Gate, phaseId, $"{kind} -> {outcome}{(reason.Length > 0 ? ": " + Trunc(reason) : "")}");
         _echo?.Gate(phaseId, kind, outcome, reason);
     }
 
     public void Escalation(string fromPhase, string toPhase, string reason)
     {
-        Add("escalation", fromPhase, $"-> {toPhase}: {Trunc(reason)}");
+        Add(RunEventKind.Escalation, fromPhase, $"-> {toPhase}: {Trunc(reason)}");
         _echo?.Escalation(fromPhase, toPhase, reason);
     }
 
     public void Promotion(string phaseId, string fromTier, string toTier)
     {
-        Add("promote", phaseId, $"{fromTier} -> {toTier}");
+        Add(RunEventKind.Promote, phaseId, $"{fromTier} -> {toTier}");
         _echo?.Promotion(phaseId, fromTier, toTier);
     }
 
     public void Conflict(string phaseId, string detail)
     {
-        Add("conflict", phaseId, detail);
+        Add(RunEventKind.Conflict, phaseId, detail);
         _echo?.Conflict(phaseId, detail);
     }
 
     public void PhaseEnd(string phaseId, string summary)
     {
-        Add("phase_end", phaseId, Trunc(summary));
+        Add(RunEventKind.PhaseEnd, phaseId, Trunc(summary));
         _echo?.PhaseEnd(phaseId, summary);
     }
 
     public void RunEnd(RunStatus status, string reason)
     {
         Status = status; FailReason = reason;
-        Add("run_end", "-", $"{status}{(reason.Length > 0 ? ": " + reason : "")}");
+        Add(RunEventKind.RunEnd, "-", $"{status}{(reason.Length > 0 ? ": " + reason : "")}");
         _echo?.RunEnd(status, reason);
     }
 

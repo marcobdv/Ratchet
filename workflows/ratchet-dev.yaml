@@ -15,7 +15,6 @@ version: 1
 name: ratchet-dev
 
 classifier:
-  output: work_type
   record: true
 
 models:
@@ -32,7 +31,7 @@ defaults:
   # Reactive layer (model-routing.md): on a red gate, promote the re-running phase's
   # driver one rung up this ladder instead of retrying at the same tier.
   driver_ladder: [driver_cheap, driver_mid, driver_strong]
-  record_escalations: true        # emit per-(phase, work_type) escalation telemetry (--routing-stats)
+  record_promotions: true         # emit per-(phase, work_type) promotion telemetry (--routing-stats)
   advisor:
     model: advisor_frontier
     consult_when: >
@@ -77,7 +76,7 @@ spine:
     driver: driver_cheap
     advisor: null               # tests are the judge; no model needed
     tools: [bash, read]
-    gate: { type: command, run: "dotnet build -clp:ErrorsOnly", pass_on: exit_zero, on_fail: implement, max_loops: 3 }
+    gate: { type: command, run: "dotnet build -clp:ErrorsOnly", on_fail: implement, max_loops: 3 }
 
   - id: review
     skippable: false            # FLOOR — merge-readiness

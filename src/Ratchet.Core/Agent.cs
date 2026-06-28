@@ -39,6 +39,8 @@ public sealed class Agent
     public async Task RunTurnAsync(Conversation conversation, CancellationToken ct)
     {
         using var turn = RatchetTelemetry.StartTurn();
+        try
+        {
         while (true)
         {
             // Text streams out live through the observer; the assembled message
@@ -70,6 +72,14 @@ public sealed class Agent
             conversation.Add(Message.UserToolResults(results));
             // Loop: the model now sees the results and decides what to do next.
         }
+        }
+        catch (Exception ex)
+        {
+            // A turn that fails (e.g. the model call throws out of the loop) must surface
+            // on the span, not close Ok — otherwise turn-level error monitoring misses it.
+            RatchetTelemetry.Fail(turn, ex);
+            throw;
+        }
     }
 
     private async Task<(string content, bool isError)> ExecuteToolAsync(ToolUseBlock call, CancellationToken ct)
@@ -80,31 +90,31 @@ public sealed class Agent
         using var span = RatchetTelemetry.StartTool(call.Name);
         var started = Stopwatch.GetTimestamp();
 
-        // Permission gate: a denial comes back as an error result the model can adapt
-        // to, never an exception — the guarantee lives here, before the tool runs.
-        var decision = await _gate.CheckAsync(call.Name, call.InputJson, ct);
-        if (!decision.Allowed)
-        {
-            RatchetTelemetry.RecordGateDenial(call.Name);
-            span?.SetTag("ratchet.gate.denied", true);
-            span?.SetStatus(ActivityStatusCode.Error, "permission denied");
-            RatchetTelemetry.RecordTool(call.Name, error: true, Stopwatch.GetElapsedTime(started).TotalSeconds);
-            return ($"Permission denied for '{call.Name}': {decision.Reason}", true);
-        }
-
         try
         {
+            // Permission gate inside the try: a denial OR a faulting custom gate comes back
+            // as an error result the model can adapt to, never an exception that kills the turn.
+            var decision = await _gate.CheckAsync(call.Name, call.InputJson, ct);
+            if (!decision.Allowed)
+            {
+                RatchetTelemetry.RecordGateDenial(call.Name);
+                span?.SetTag("ratchet.gate.denied", true);
+                span?.SetStatus(ActivityStatusCode.Error, "permission denied");
+                RatchetTelemetry.RecordTool(call.Name, "permission_denied", Stopwatch.GetElapsedTime(started).TotalSeconds);
+                return ($"Permission denied for '{call.Name}': {decision.Reason}", true);
+            }
+
             var result = await tool.ExecuteAsync(call.InputJson, ct);
-            RatchetTelemetry.RecordTool(call.Name, error: false, Stopwatch.GetElapsedTime(started).TotalSeconds);
+            RatchetTelemetry.RecordTool(call.Name, errorType: null, Stopwatch.GetElapsedTime(started).TotalSeconds);
             return (result, false);
         }
         catch (Exception ex)
         {
-            // Tool failures are not agent failures: hand the error back to the
+            // Tool (or gate) faults are not agent failures: hand the error back to the
             // model as a result so it can recover, rather than crashing the loop.
             span?.SetStatus(ActivityStatusCode.Error, ex.Message);
-            RatchetTelemetry.RecordTool(call.Name, error: true, Stopwatch.GetElapsedTime(started).TotalSeconds);
-            return ($"Tool '{call.Name}' threw: {ex.Message}", true);
+            RatchetTelemetry.RecordTool(call.Name, ex.GetType().Name, Stopwatch.GetElapsedTime(started).TotalSeconds);
+            return ($"Tool '{call.Name}' failed: {ex.Message}", true);
         }
     }
 }

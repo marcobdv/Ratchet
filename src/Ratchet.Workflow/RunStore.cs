@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodeStack.Ratchet.Core;
 
 namespace CodeStack.Ratchet.Workflow;
 
@@ -68,12 +69,17 @@ public sealed class FileRunStore : IRunStore
     public void Save(RunSnapshot snapshot)
     {
         snapshot.UpdatedUtc = DateTime.UtcNow.ToString("o");
-        var path = Path.Combine(_dir, snapshot.RunId + ".json");
-        File.WriteAllText(path, JsonSerializer.Serialize(snapshot, Json));
+        var path = Path.Combine(_dir, SessionId.Validate(snapshot.RunId) + ".json");
+        // Write to a temp file then atomically replace, so a crash mid-write can't truncate
+        // the only resume checkpoint (which is the whole point of writing it before each phase).
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(snapshot, Json));
+        File.Move(tmp, path, overwrite: true);
     }
 
     public RunSnapshot? Load(string runId)
     {
+        if (!SessionId.IsValid(runId)) return null;
         var path = Path.Combine(_dir, runId + ".json");
         if (!File.Exists(path)) return null;
         try { return JsonSerializer.Deserialize<RunSnapshot>(File.ReadAllText(path), Json); }

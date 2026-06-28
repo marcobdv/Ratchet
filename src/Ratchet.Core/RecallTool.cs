@@ -41,6 +41,8 @@ public sealed class RecallTool : ITool
     public Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
     {
         var query = Json.GetString(inputJson, "query");
+        if (string.IsNullOrWhiteSpace(query))
+            return Task.FromResult("recall needs a non-empty query.");   // else every node "matches"
 
         var max = 5;
         using (var doc = JsonDocument.Parse(inputJson))

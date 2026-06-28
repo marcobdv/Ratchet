@@ -33,32 +33,23 @@ public static class GitTools
         yield return new GitCommitTool(workingDirectory);
     }
 
+    /// <summary>Run git, returning exit code + combined output. Kills the child on cancel (via ProcessRunner).</summary>
+    internal static async Task<(int exitCode, string output)> RunGitRawAsync(string workingDirectory, IEnumerable<string> args, CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo { FileName = "git", WorkingDirectory = workingDirectory };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        try
+        {
+            return await ProcessRunner.RunAsync(psi, ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { return (-1, $"could not run git: {ex.Message} (is git installed and on PATH?)"); }
+    }
+
     internal static async Task<string> RunGitAsync(string workingDirectory, IEnumerable<string> args, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = "git",
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        foreach (var a in args) psi.ArgumentList.Add(a);
-
-        using var proc = new Process { StartInfo = psi };
-        var output = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-
-        try { proc.Start(); }
-        catch (Exception ex) { return $"could not run git: {ex.Message} (is git installed and on PATH?)"; }
-
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-
-        var text = output.ToString().TrimEnd();
+        var (_, output) = await RunGitRawAsync(workingDirectory, args, ct);
+        var text = output.TrimEnd();
         return text.Length == 0 ? "(no output)" : text;
     }
 }
@@ -155,8 +146,11 @@ public sealed class GitCommitTool : ITool
 
         if (addAll)
         {
-            var add = await GitTools.RunGitAsync(_cwd, new[] { "add", "-A" }, ct);
-            if (add.StartsWith("could not run git", StringComparison.Ordinal)) return add;
+            // Gate the commit on `git add` actually succeeding (exit 0), not just on spawn —
+            // otherwise a failed add (lock, hook, path error) would fall through to a confusing
+            // partial/empty commit.
+            var (addExit, addOut) = await GitTools.RunGitRawAsync(_cwd, new[] { "add", "-A" }, ct);
+            if (addExit != 0) return $"git add failed (exit {addExit}); not committing:\n{addOut.Trim()}";
         }
         return await GitTools.RunGitAsync(_cwd, new[] { "commit", "-m", message }, ct);
     }

@@ -73,9 +73,11 @@ public sealed class AnthropicChatClient : IChatClient
             {
                 case "message_start":
                     if (root.TryGetProperty("message", out var m) &&
-                        m.TryGetProperty("usage", out var u0) &&
-                        u0.TryGetProperty("input_tokens", out var it))
-                        inputTokens = it.GetInt32();
+                        m.TryGetProperty("usage", out var u0))
+                        // Include the cached portions so input accounting reflects billed input.
+                        inputTokens = UsageInt(u0, "input_tokens")
+                                    + UsageInt(u0, "cache_creation_input_tokens")
+                                    + UsageInt(u0, "cache_read_input_tokens");
                     break;
 
                 case "content_block_start":
@@ -193,16 +195,20 @@ public sealed class AnthropicChatClient : IChatClient
         w.WriteNumber("max_tokens", (int)(options?.MaxOutputTokens ?? _maxTokens));
         w.WriteBoolean("stream", true);
 
-        // Cache the stable system prompt + tools, and the transcript tail — same
-        // breakpoint strategy as AnthropicClient. See CacheControl.
-        w.WritePropertyName("system");
-        w.WriteStartArray();
-        w.WriteStartObject();
-        w.WriteString("type", "text");
-        w.WriteString("text", system.ToString());
-        CacheControl.Write(w);
-        w.WriteEndObject();
-        w.WriteEndArray();
+        // Cache the stable system prompt + tools, and the transcript tail — same breakpoint
+        // strategy as AnthropicClient. Only emit the system array when non-empty: Anthropic
+        // rejects an empty text content block (400), which would break tool-only requests.
+        if (system.Length > 0)
+        {
+            w.WritePropertyName("system");
+            w.WriteStartArray();
+            w.WriteStartObject();
+            w.WriteString("type", "text");
+            w.WriteString("text", system.ToString());
+            CacheControl.Write(w);
+            w.WriteEndObject();
+            w.WriteEndArray();
+        }
 
         WriteTools(w, options?.Tools);
         WriteMessages(w, messageList);
@@ -305,6 +311,9 @@ public sealed class AnthropicChatClient : IChatClient
         hasToolCalls || stopReason == "tool_use" ? ChatFinishReason.ToolCalls
         : stopReason == "max_tokens" ? ChatFinishReason.Length
         : ChatFinishReason.Stop;
+
+    private static int UsageInt(JsonElement usage, string prop) =>
+        usage.TryGetProperty(prop, out var v) && v.TryGetInt32(out var n) ? n : 0;
 
     private sealed class ToolBuilder
     {

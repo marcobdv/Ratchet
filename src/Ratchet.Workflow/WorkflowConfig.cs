@@ -21,7 +21,7 @@ public sealed record WorkflowConfig(
     IReadOnlyList<PhaseSpec> Spine,
     IReadOnlyDictionary<string, WorkTypeSpec> WorkTypes,
     IReadOnlyList<string> DriverLadder,
-    bool RecordEscalations)
+    bool RecordPromotions)
 {
     public PhaseSpec? Phase(string id) => Spine.FirstOrDefault(p => p.Id == id);
 

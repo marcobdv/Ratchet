@@ -41,28 +41,12 @@ public sealed class TestTool : ITool
         var extra = Json.GetStringOrNull(inputJson, "args");
         var command = string.IsNullOrWhiteSpace(extra) ? _baseCommand : $"{_baseCommand} {extra}";
 
-        var psi = new ProcessStartInfo
-        {
-            FileName = _shell.FileName,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
+        var psi = new ProcessStartInfo { FileName = _shell.FileName };
         psi.ArgumentList.Add(_shell.CommandFlag);
         psi.ArgumentList.Add(command);
 
-        using var proc = new Process { StartInfo = psi };
-        var output = new StringBuilder();
-        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) output.AppendLine(e.Data); };
-
-        proc.Start();
-        proc.BeginOutputReadLine();
-        proc.BeginErrorReadLine();
-        await proc.WaitForExitAsync(ct);
-
-        return Summarize(command, output.ToString(), proc.ExitCode);
+        var (exitCode, output) = await ProcessRunner.RunAsync(psi, ct);
+        return Summarize(command, output, exitCode);
     }
 
     private static string Summarize(string command, string raw, int exitCode)

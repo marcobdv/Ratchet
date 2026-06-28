@@ -32,3 +32,25 @@ public sealed class AllowAllGate : IToolGate
     public Task<ToolGateDecision> CheckAsync(string toolName, string inputJson, CancellationToken ct) =>
         Task.FromResult(ToolGateDecision.Allow);
 }
+
+/// <summary>
+/// Deny-by-default gate for a read-only role: only tools that cannot mutate state are
+/// allowed; everything else (write/edit/bash/git_commit/rename/MCP/…) is refused. This is
+/// how a <i>delegated</i> sub-agent is scoped to its role even though the top-level agent is
+/// YOLO — the constraint is enforced in the loop, not left to the sub-agent's prompt. New
+/// tools are denied unless explicitly added here, so the safe default is "can't mutate".
+/// </summary>
+public sealed class ReadOnlyGate : IToolGate
+{
+    private static readonly HashSet<string> Allowed = new(StringComparer.Ordinal)
+    {
+        "read", "search", "recall", "load_skill",
+        "git_status", "git_diff",
+        "roslyn_diagnostics", "roslyn_find_symbol", "roslyn_find_references", "roslyn_outline",
+    };
+
+    public Task<ToolGateDecision> CheckAsync(string toolName, string inputJson, CancellationToken ct) =>
+        Task.FromResult(Allowed.Contains(toolName)
+            ? ToolGateDecision.Allow
+            : ToolGateDecision.Deny($"'{toolName}' is not available to this read-only sub-agent."));
+}
