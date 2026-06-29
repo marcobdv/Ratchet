@@ -1,31 +1,185 @@
-# Ratchet v0
+# Ratchet — a tiny .NET coding agent you can read
 
-A deliberately tiny .NET 9 coding agent — a "pi-plain" port. Four tools, one
-loop, a hand-rolled Anthropic client. The point is **understanding the agent
-loop at the wire level**, not competing with Claude Code.
+A deliberately small .NET 9 coding agent — a "pi-plain" port. **Four tools, one
+loop, a hand-rolled Anthropic client.** The point is *understanding the agent loop at
+the wire level*, not competing with Claude Code — and then growing it toward a real
+agent **without ever editing the loop**, by hanging every feature off a seam.
 
-> This is the learning atom from `01. Projects/Ideas/Ratchet.md`. v0.1–v0.5 kept it
-> stripped (no MCP, no Roslyn, no sub-agents). **v0.6 grows along the seams the README
-> always promised**: the `ILlmClient` seam now rides `Microsoft.Extensions.AI.IChatClient`
-> (provider-agnostic), and `ITool` gains Roslyn, MCP, sub-agents/advisors, and skills — each
-> in its own project so Core stays dependency-free. The loop, tree, and handover are untouched.
+> v0.1–v0.5 kept it stripped (no MCP, no Roslyn, no sub-agents). From v0.6 it grows
+> along the seams the design always promised: `ILlmClient` now rides
+> `Microsoft.Extensions.AI.IChatClient` (provider-agnostic), and `ITool` gains Roslyn,
+> MCP, sub-agents/advisors, and skills — each in its own project so `Ratchet.Core`
+> stays dependency-free. The loop, the session tree, and handover are untouched.
 
-## Run it
+The decisions behind the design are recorded as [Architecture Decision Records](docs/adr/README.md).
+
+## 🏗️ Architecture Overview
+
+One idea holds the whole project together: **the loop is immutable; everything grows
+on a seam.** `Ratchet.Core` is dependency-free (BCL only) — it owns the loop and a
+handful of interfaces. Every heavyweight capability (a provider client, a store, the
+Roslyn/MCP tools, the workflow orchestrator) lives in its *own* project behind one of
+those seams, and the CLI is the single composition root that wires concrete
+implementations in.
+
+```mermaid
+flowchart TB
+    CLI["Ratchet.Cli<br/>composition root · REPL · console observer · OTel wiring"]
+
+    subgraph core["Ratchet.Core — dependency-free (BCL only)"]
+        LOOP["Agent.RunTurnAsync<br/><b>the loop</b> — one while"]
+        ILlm(["ILlmClient"])
+        ITool(["ITool"])
+        IStore(["ISessionStore"])
+        IGate(["IToolGate"])
+        IObs(["IAgentObserver"])
+        TEL["RatchetTelemetry<br/>ActivitySource + Meter"]
+        LOOP --> ILlm & ITool & IStore & IGate & IObs
+        LOOP -.instruments.-> TEL
+    end
+
+    subgraph llm["Ratchet.Llm"]
+        AC["AnthropicClient<br/>native wire"]
+        OAI["OpenAiChatClient<br/>OpenAI-compatible"]
+        CCL["ChatClientLlm<br/>IChatClient adapter"]
+    end
+
+    subgraph tools["tools (ITool)"]
+        BUILTIN["read · write · edit · bash<br/>search · plan · tests · git · recall"]
+        ROSLYN["Tools.Roslyn<br/>semantic C#"]
+        MCP["Tools.Mcp<br/>.mcp.json servers"]
+        SUB["SubAgents<br/>explore + advisors"]
+    end
+
+    subgraph stores["stores (ISessionStore)"]
+        FILE["FileSessionStore<br/>JSON"]
+        SQL["Storage.Sqlite<br/>FTS5"]
+    end
+
+    WF["Ratchet.Workflow<br/>deterministic spine + gates"]
+
+    CLI --> LOOP
+    CLI --> WF
+    WF --> LOOP
+    ILlm --> AC & OAI & CCL
+    ITool --> BUILTIN & ROSLYN & MCP & SUB
+    IStore --> FILE & SQL
+```
+
+### The loop
+
+The entire agent is one `while` in `Core/Agent.cs` — read it first. A turn calls the
+model, streams the reply, runs any tools the model asked for (each checked by the
+permission gate first), appends the results, and repeats until the model stops asking
+for tools. Everything else in this README is a thing that plugs into a seam *this loop
+already calls*.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Agent as Agent.RunTurnAsync
+    participant Llm as ILlmClient
+    participant Gate as IToolGate
+    participant Tool as ITool
+    User->>Agent: prompt
+    loop until the model stops requesting tools
+        Agent->>Llm: messages + tool specs
+        Llm-->>Agent: stream text + tool calls (SSE)
+        alt model requested a tool
+            Agent->>Gate: allowed?
+            Gate-->>Agent: allow / deny
+            Agent->>Tool: execute (if allowed)
+            Tool-->>Agent: result block (or [tool error])
+        end
+    end
+    Agent-->>User: final assistant text
+    Note over Agent: each turn appends nodes to the session tree (HEAD over a DAG)
+```
+
+### The seams
+
+Each interface is the exact point where a doc'd feature plugs in — and the reason the
+project can grow toward the full Ratchet without a rewrite:
+
+| Seam | What it abstracts | Implementations |
+|---|---|---|
+| `ILlmClient` | a model turn (build request, consume stream) | Anthropic native wire · `AnthropicChatClient` · `OpenAiChatClient` · `ChatClientLlm` (any `IChatClient`) |
+| `ITool` | a callable tool + its JSON schema | read/write/edit/bash · search · plan · tests · git · recall · Roslyn · MCP · sub-agents |
+| `ISessionStore` | persistence of the message tree | `FileSessionStore` (JSON) · `SqliteSessionStore` (incremental inserts, recursive-CTE path walks) |
+| `ITextSearchableStore` | full-text search behind `recall` | SQLite FTS5 (file store falls back to an in-memory scan) |
+| `IToolGate` | permission decision before a tool runs | `AllowAllGate` (default) · `ConsoleToolGate` · `ReadOnlyGate` (scopes delegated sub-agents) |
+| `IAgentObserver` | per-token / per-event stream out of a turn | console renderer · audit logging / TUI / ACP later |
+| `IWorkflowObserver` · `IRunStore` | record a workflow run's decisions | `WorkflowRun` + `FileRunStore` (`.ratchet/runs/<id>.json`) |
+
+Because Core takes no dependencies, even the OpenTelemetry instrumentation lives there
+on the **vendor-neutral BCL** `ActivitySource`/`Meter` — only the CLI references the
+OTel SDK and wires exporters.
+
+### Workflow orchestration
+
+For larger tasks, run the agent through a fixed, ordered **spine** of phases instead
+of one undifferentiated turn. The orchestrator is **deterministic** — it runs phases,
+evaluates gates, and routes (advance / loop-back / escalate). LLM judgment shows up at
+exactly two points: a one-call **classifier** that sizes the task into a `work_type`
+(which phase subset runs), and **judge gates** that spend a frontier model on
+merge-readiness an exit code can't express. **Command gates** route on a process exit
+code — the cheapest, strongest judge there is. Floors (`verify`, `review`) always run.
+
+```mermaid
+flowchart TB
+    TASK["task"] --> CLASS{{"classifier — 1 LLM call<br/>sizes task → work_type"}}
+    CLASS --> SPINE
+
+    subgraph SPINE["deterministic spine — phase subset per work_type"]
+        direction LR
+        R["research"] --> P["plan"] --> I["implement"] --> V["verify"] --> RV["review"] --> L["land"]
+    end
+
+    V -. "command gate<br/>dotnet build / test" .-> VG{exit 0?}
+    VG -- no --> I
+    RV -. "judge gate<br/>frontier model" .-> RG{merge-ready?}
+    RG -- no --> RV
+    I -. "bigger than its sizing" .-> ESC["escalate up the spine<br/>(fresh context)"]
+    ESC --> R
+    L --> DONE["branch + commit"]
+
+    classDef floor fill:#f9d5e5,stroke:#c2185b,color:#333
+    class V,RV floor
+```
+
+Phase-to-phase context handoff *is* the v0.5 handover machinery (an authored doc +
+`recall`), not a shared scratchpad. Each phase is its own `Agent` with its own role,
+tool subset, model tier, and skills — so cheap models do the bulk and frontier spend
+concentrates at the gates. Full design: [`docs/workflow-orchestration.md`](docs/workflow-orchestration.md).
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- **.NET 9 SDK**
+- An **Anthropic API key** (default provider) — or any of the providers in the table below
+- *(optional)* an MCP-capable tool, a local model server (Ollama/LM Studio/vLLM), or an
+  OTel collector for the extras
+
+### Run it
 
 ```powershell
 setx ANTHROPIC_API_KEY "sk-ant-..."   # once, then open a new terminal
-cd D:\Repos\Ratchet
+cd C:\repos\private\Ratchet
 dotnet run --project src/Ratchet.Cli
 ```
 
-Optional: drop an `AGENTS.md` in the working directory and it's prepended to the
-system prompt. Override the model with `RATCHET_MODEL` (defaults to
-`claude-sonnet-4-6` — swap when a newer one ships). Pick the shell the `bash`
-tool drives with `RATCHET_SHELL` — `bash`, `cmd`, or `pwsh` (PowerShell 7+).
-Unset, it defaults to cmd on Windows and bash elsewhere.
+Drop an `AGENTS.md` in the working directory and it's prepended to the system prompt.
+Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
 
-**Not tied to Anthropic.** Pick the backend with `RATCHET_PROVIDER` — Ratchet talks to
-any of them (and every other config, tools, sessions, workflows, work the same):
+`ratchet --roslyn-check` runs the Roslyn tools against the current solution with no API
+key (a self-test). Sessions auto-save to `.ratchet/sessions/` after each turn; `ratchet
+-c` reopens the most recent. (Gitignore `.ratchet/` in real projects.)
+
+### Providers — not tied to Anthropic
+
+Pick the backend with `RATCHET_PROVIDER`; everything else (tools, sessions, workflows)
+works the same regardless:
 
 | `RATCHET_PROVIDER` | endpoint | key env | notes |
 |---|---|---|---|
@@ -40,9 +194,9 @@ any of them (and every other config, tools, sessions, workflows, work the same):
 Everything except Anthropic flows through one hand-rolled OpenAI-compatible client
 (`Llm/OpenAiChatClient.cs`). For non-Anthropic providers set `RATCHET_MODEL` to that
 backend's model id (e.g. OpenRouter `anthropic/claude-sonnet-4` or `openai/gpt-4o`;
-Groq `llama-3.3-70b-versatile`). `RATCHET_BASE_URL` overrides the endpoint for any
-OpenAI-compatible provider (proxies, gateways). OpenRouter attribution headers come from
-`RATCHET_OPENROUTER_REFERER` / `RATCHET_OPENROUTER_TITLE`. Example:
+Groq `llama-3.3-70b-versatile`). The same provider names work per-tier in a workflow's
+`models:` block, so one run can mix a cheap `local` driver with an `openrouter` frontier
+judge.
 
 ```powershell
 $env:RATCHET_PROVIDER = "openrouter"
@@ -51,67 +205,71 @@ $env:RATCHET_MODEL = "anthropic/claude-sonnet-4"   # or openai/gpt-4o, google/ge
 dotnet run --project src/Ratchet.Cli
 ```
 
-The same provider names work for a workflow's per-tier `models:` block, so one workflow
-can mix backends (a cheap `local` driver with an `openrouter` frontier judge).
+### In-session commands
 
-The extra tools light up from the working directory: a `.mcp.json` connects MCP
-servers, `.ratchet/skills/<name>/SKILL.md` (or `.claude/skills/…`) registers skills,
-and the Roslyn + `explore`/advisor tools are always available. `ratchet --roslyn-check`
-runs the Roslyn tools against the current solution with no API key (a self-test).
+`/sessions`, `/resume <id>`, `/new`, `/tree` (show the branch tree), `/rewind [n]`
+(move HEAD back n turns), `/goto <node>` (jump to a branch tip), `/handover` (write a
+handover doc), `/handovers` (list them), `/compact` (fold this session into a handover
+and continue fresh), `/help`.
 
-```powershell
-$env:RATCHET_SHELL = "pwsh"            # this session only
-setx RATCHET_SHELL "pwsh"             # persistent (new terminal to take effect)
-```
+### Environment knobs
 
-Try: *"create hello.txt with a haiku about warehouses, then read it back"*.
+| Variable | Effect |
+|---|---|
+| `RATCHET_MODEL` | model id (default `claude-sonnet-4-6`) |
+| `RATCHET_SHELL` | shell the `bash` tool drives — `bash` / `cmd` / `pwsh` (default cmd on Windows, bash elsewhere) |
+| `RATCHET_STORE` | `sqlite` switches the session store to one `.ratchet/ratchet.db` (default: JSON files) |
+| `RATCHET_GATE` | `prompt` / `deny` turns on the permission gate for mutating tools (default: off, YOLO) |
+| `RATCHET_CONTEXT_LIMIT` | input-token threshold past which Ratchet auto-compacts into a self-handover |
+| `RATCHET_PTY` | `1` opts the `bash` tool into a Windows ConPTY pseudo-console (a real TTY) |
+| `RATCHET_TEST_CMD` | command `run_tests` invokes (default `dotnet test`) |
+| `RATCHET_READ_MAX_BYTES` | cap on a single `read` (default 256 KB, then truncates with a notice) |
+| `RATCHET_OTEL` | `console` / `otlp` enables OpenTelemetry export (default: off) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP target (default `http://localhost:4317`) |
 
-In-session commands: `/sessions`, `/resume <id>`, `/new`, `/tree` (show the
-branch tree), `/rewind [n]` (move HEAD back n turns), `/goto <node>` (jump to a
-branch tip), `/handover` (write a handover doc), `/handovers` (list them),
-`/compact` (fold this session into a handover and continue fresh), `/help`.
-Sessions auto-save to `.ratchet/sessions/` after each turn; `ratchet -c`
-reopens the most recent. (Gitignore `.ratchet/` in real projects.)
+## 🧰 Tools
 
-More tools are always on besides the four primitives: `update_plan` (an explicit,
-revisable task checklist), `run_tests` (runs the suite — `dotnet test` by default,
-override with `RATCHET_TEST_CMD` — and returns a parsed pass/fail summary), and
-`git_status` / `git_diff` (read-only — staging/committing stay behind the
-not-yet-built permission gate). The `edit` tool requires you to have read a file
-first and that its match be unique (or pass `replace_all`).
+Beyond the four primitives (`read` / `write` / `edit` / `bash`), these `ITool`s are
+always on:
 
-Two more env knobs: `RATCHET_CONTEXT_LIMIT` sets an input-token threshold past which
-Ratchet auto-compacts (see v0.7); `RATCHET_PTY=1` opts the `bash` tool into a Windows
-ConPTY pseudo-console (a real TTY) instead of redirected pipes.
+- **`search`** — read-only code search (regex content + filename glob), working-dir
+  scoped. Also the only mutating-free tool the `explore` sub-agent gets.
+- **`update_plan`** — an explicit, re-sent task checklist.
+- **`run_tests`** — runs the suite (`dotnet test` by default, `RATCHET_TEST_CMD` to
+  override) and returns a parsed pass/fail summary.
+- **`git_status` / `git_diff`** — read-only repo awareness. `git_commit` /
+  `git_create_branch` are mutating, so the permission gate governs them.
+- **`recall`** — searches a prior session's cold-stored tree (FTS5 when on SQLite).
+- **Roslyn** — semantic C#: diagnostics, find-symbol/references, outline, rename
+  (MSBuildWorkspace). Lights up from the working solution.
+- **MCP** — a `.mcp.json` connects MCP servers; each server tool becomes an `ITool`.
+- **Sub-agents** — `explore` (a read-only investigator) and advisors, each a nested
+  `Agent` behind the `delegate` tool.
+- **`load_skill`** — `SKILL.md` discovery + progressive disclosure from
+  `.ratchet/skills/<name>/` or `.claude/skills/…`.
 
-### Workflows (phased orchestration)
+The `edit` tool requires you to have read a file first and that its match be unique (or
+pass `replace_all`).
 
-Instead of one undifferentiated agent, run a task through a fixed sequence of phases
-(`research → plan → implement → verify → review`), each with its own role, tool subset,
-model tier, and skills — cheap models do the bulk, frontier spend is concentrated at
-gates:
+## 🔄 Workflows (phased orchestration)
 
 ```powershell
 ratchet --workflow workflows/ratchet-dev.yaml "add a --version flag to the CLI"
 ```
 
-The orchestrator is **deterministic** (the spine, the gates, loop-back, escalation);
-LLM judgment shows up only at the intake classifier (which sizes the task into a
-`work_type`) and at judge gates. Floors (`verify`, `review`) always run, and a final
-`land` phase branches + commits the reviewed change (`git_commit`, governed by the
-permission gate). Phase-to-phase context uses the v0.5 handover + `recall` machinery.
-Local/OpenAI-compatible driver tiers point at any `/v1` endpoint via
-`RATCHET_LOCAL_BASE_URL` (e.g. Ollama).
+Every run is recorded to `.ratchet/runs/<id>.json` — the classification + reasoning,
+the event trace, and **per-tier token cost** (so "are the cheap drivers actually
+carrying the load?" is answerable). Inspect with `ratchet --runs` / `ratchet --run
+<id>`. An interrupted run checkpoints after each phase and continues with `ratchet
+--workflow-resume <id>`. `ratchet --routing-stats` aggregates the escalation rate per
+`(work_type, phase)` so a wrong cheap default shows up and is retuned with a one-line
+config diff. The full design and rationale is
+[`docs/workflow-orchestration.md`](docs/workflow-orchestration.md); model routing is
+[`docs/model-routing.md`](docs/model-routing.md).
 
-Every run is recorded to `.ratchet/runs/<id>.json` — the classification + reasoning, the
-event trace, and **per-tier token cost** (so "are the cheap drivers actually carrying the
-load?" is answerable). Inspect with `ratchet --runs` / `ratchet --run <id>`. An interrupted
-run checkpoints after each phase and continues with `ratchet --workflow-resume <id>`. The
-full design and rationale is `docs/workflow-orchestration.md`.
+## 📊 Observability (OpenTelemetry)
 
-### Observability (OpenTelemetry)
-
-The agent is instrumented with OpenTelemetry — **off by default**, opt in with `RATCHET_OTEL`:
+Instrumented with OpenTelemetry — **off by default**, opt in with `RATCHET_OTEL`:
 
 ```powershell
 $env:RATCHET_OTEL = "console"   # print spans + metrics to stdout
@@ -120,72 +278,96 @@ $env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4317"   # otlp target (defa
 ```
 
 It follows the OpenTelemetry **GenAI semantic conventions** (`gen_ai.*`), so any OTel
-backend renders it natively. **Traces** nest into a tree: `workflow.run → phase → agent.turn
-→ chat {model}` / `execute_tool {name}` / `gate {kind}` — with `gen_ai.provider.name`,
-`gen_ai.request.model`, token usage, finish reason, and gate-denied flags on the spans.
-**Metrics**: `gen_ai.client.token.usage`, `gen_ai.client.operation.duration`,
-`ratchet.tool.calls` / `ratchet.tool.duration`, `ratchet.gate.denials`. The instrumentation
-lives in Core on the vendor-neutral BCL diagnostics API (`RatchetTelemetry`), so it's
-**zero-cost when nothing is listening** and Core takes no OpenTelemetry dependency — only the
-CLI wires the SDK + exporters, the same instrument-in-Core / configure-at-the-root seam as
-everything else.
+backend renders it natively. **Traces** nest into a tree: `workflow.run → phase →
+agent.turn → chat {model}` / `execute_tool {name}` / `gate {kind}` — with
+`gen_ai.provider.name`, `gen_ai.request.model`, token usage, finish reason, and
+gate-denied flags. **Metrics**: `gen_ai.client.token.usage`,
+`gen_ai.client.operation.duration`, `ratchet.tool.calls` / `ratchet.tool.duration`,
+`ratchet.gate.denials`. The instrumentation lives in Core on the vendor-neutral BCL
+diagnostics API (`RatchetTelemetry`), so it's **zero-cost when nothing is listening**
+and Core takes no OpenTelemetry dependency — only the CLI wires the SDK + exporters.
 
-Storage backend is swappable via `RATCHET_STORE`: unset (default) writes one
-JSON file per session under `.ratchet/sessions/`; `sqlite` uses a single
-`.ratchet/ratchet.db` and inserts only new nodes per turn (no full rewrite).
-Both implement the same `ISessionStore` seam.
+## 💾 Storage
 
-Resume cold from a handover with `ratchet --handover <session-id>`: a fresh
-session that carries the handover doc as its working set and gains a `recall`
-tool to page detail back out of the prior session.
+Swappable via `RATCHET_STORE`: unset (default) writes one JSON file per session under
+`.ratchet/sessions/`; `sqlite` uses a single `.ratchet/ratchet.db` and inserts only new
+nodes per turn (no full rewrite). Both implement the same `ISessionStore` seam. Resume
+cold from a handover with `ratchet --handover <session-id>`: a fresh session that
+carries the handover doc as its working set and gains a `recall` tool to page detail
+back out of the prior session.
 
-## The core files
+## 📂 Project Structure
 
-| File | What it is |
+```
+Ratchet/
+├── Ratchet.sln
+│
+├── docs/
+│   ├── adr/                         # Architecture Decision Records (the "why")
+│   ├── workflow-orchestration.md
+│   └── model-routing.md
+├── workflows/
+│   └── ratchet-dev.yaml             # a concrete workflow instance
+│
+├── src/Ratchet.Core/               # dependency-free: the loop + the seams
+│   ├── Agent.cs                     #   THE LOOP — read it first (one while)
+│   ├── Conversation.cs             #   transcript + the four wire content-block shapes
+│   ├── ILlmClient.cs · ITool.cs    #   the model + tool seams
+│   ├── Tools.cs                     #   read / write / edit / bash
+│   ├── SearchTool.cs               #   read-only regex + glob code search
+│   ├── Sessions.cs                  #   session TREE (HEAD over a DAG) + JSON store
+│   ├── Handover.cs · RecallTool.cs #   handover doc + retrieval back into cold storage
+│   ├── SubAgents.cs                 #   delegate tool: a nested Agent (explore + advisors)
+│   ├── Skills.cs                    #   SKILL.md discovery + load_skill
+│   ├── PlanTool.cs · TestTool.cs   #   update_plan · run_tests
+│   ├── GitTools.cs                  #   git_status / git_diff (+ gated commit/branch)
+│   ├── ToolGate.cs                  #   IToolGate: AllowAll (default) / ReadOnly
+│   ├── ProcessRunner.cs            #   kill-on-cancel + output-drain process helper
+│   ├── FileAccessLog.cs            #   read-before-write guard for read/write/edit
+│   ├── WindowsPty.cs                #   opt-in ConPTY pseudo-console for bash
+│   └── RatchetTelemetry.cs         #   OTel instrumentation (BCL ActivitySource + Meter)
+│
+├── src/Ratchet.Llm/                # provider clients (behind ILlmClient)
+│   ├── AnthropicClient.cs          #   wire-level Messages API (anthropic-native)
+│   ├── AnthropicChatClient.cs      #   the same wire as a Microsoft.Extensions.AI IChatClient
+│   ├── ChatClientLlm.cs            #   ILlmClient over any IChatClient (the adopt-IChatClient seam)
+│   ├── OpenAiChatClient.cs         #   one hand-rolled OpenAI-compatible client (everything non-Anthropic)
+│   └── CacheControl.cs             #   prompt-caching breakpoints
+│
+├── src/Ratchet.Storage.Sqlite/     # ISessionStore + ITextSearchableStore over SQLite/FTS5
+├── src/Ratchet.Tools.Roslyn/       # semantic C# tools (MSBuildWorkspace)
+├── src/Ratchet.Tools.Mcp/          # MCP servers from .mcp.json → ITools
+│
+├── src/Ratchet.Workflow/           # the orchestrator (above the loop, +YamlDotNet)
+│   ├── WorkflowScheduler.cs        #   deterministic spine + gates + routing + promotion
+│   ├── WorkflowLoader.cs · WorkflowConfig.cs   # YAML → validated domain model
+│   ├── Classifier.cs               #   the one intake LLM call → work_type
+│   ├── Gates.cs                     #   command gates + judge gates
+│   ├── PhaseTools.cs               #   per-phase tool wiring + escalation/consult
+│   ├── RunStore.cs · WorkflowRun.cs #  persisted run record + cost tally
+│   └── MeteredLlmClient.cs         #   per-tier token accounting (transparent wrapper)
+│
+└── src/Ratchet.Cli/
+    └── Program.cs                   # composition root: wiring + console observer + REPL
+```
+
+## 🎯 Key Design Decisions
+
+The full reasoning — context, the alternative we rejected, and the consequences — lives
+in [`docs/adr/`](docs/adr/README.md). The contested ones, mapped to the version they
+landed in:
+
+| Version | Decision |
 |---|---|
-| `Core/Agent.cs` | **The loop.** Read it first — the entire idea is one `while`. |
-| `Core/Conversation.cs` | The transcript + the four wire content-block shapes. |
-| `Core/ITool.cs` | The extension seam + registry. |
-| `Core/Tools.cs` | read / write / edit / bash. |
-| `Core/Sessions.cs` | Session **tree** (HEAD over a DAG) + the JSON-file store. |
-| `Core/Handover.cs` | Handover doc, prompt template, file store, generator. |
-| `Core/RecallTool.cs` | Retrieval back into a prior session's cold-stored nodes. |
-| `Core/SubAgents.cs` | `DelegateTool` — a tool that runs a nested `Agent`. The `explore` sub-agent + advisors. |
-| `Core/Skills.cs` | SKILL.md discovery + the `load_skill` tool (progressive disclosure). |
-| `Llm/AnthropicClient.cs` | Wire-level Messages API — builds JSON & consumes the SSE stream by hand (`anthropic-native`). |
-| `Llm/AnthropicChatClient.cs` | The same wire client exposed as a `Microsoft.Extensions.AI.IChatClient`. |
-| `Llm/ChatClientLlm.cs` | `ILlmClient` over any `IChatClient` — this is the "adopt IChatClient" seam. |
-| `Tools.Roslyn/` | Semantic C#: diagnostics, find-symbol/references, outline, rename (MSBuildWorkspace). |
-| `Tools.Mcp/` | Connects MCP servers from `.mcp.json`; each server tool becomes an `ITool`. |
-| `Core/PlanTool.cs` | `update_plan` — an explicit, re-sent task checklist (planning). |
-| `Core/TestTool.cs` | `run_tests` — runs the suite and returns a parsed pass/fail summary. |
-| `Core/GitTools.cs` | `git_status` / `git_diff` — read-only repo awareness. |
-| `Core/FileAccessLog.cs` | The read-before-write guard shared by read/write/edit. |
-| `Core/WindowsPty.cs` | Opt-in ConPTY pseudo-console runner for `bash` (`RATCHET_PTY=1`). |
-| `Core/RatchetTelemetry.cs` | OpenTelemetry instrumentation (ActivitySource + Meter, GenAI conventions); SDK wired in the CLI. |
-| `Core/SearchTool.cs` | Read-only code search (regex + glob); the `explore` sub-agent's tool instead of a raw shell. |
-| `Core/ToolGate.cs` | `IToolGate` permission seam: `AllowAllGate` (default) and `ReadOnlyGate` (scopes delegated sub-agents). |
+| v0 / ongoing | [ADR-0001](docs/adr/0001-immutable-loop-grow-on-seams.md) the loop is immutable; all growth happens on seams · [ADR-0002](docs/adr/0002-core-stays-dependency-free.md) Core stays dependency-free; heavy deps in separate projects |
+| v0.3 | [ADR-0003](docs/adr/0003-session-as-branch-tree.md) a session is a branch tree (HEAD over a DAG), the git model |
+| v0.5 | [ADR-0004](docs/adr/0004-handover-not-compaction.md) retrieval-backed handover, never silent in-place compaction |
+| v0.6 | [ADR-0005](docs/adr/0005-provider-agnostic-keep-native-wire.md) provider-agnostic via `IChatClient`, but keep the hand-rolled wire |
+| v0.8 | [ADR-0006](docs/adr/0006-deterministic-orchestrator.md) deterministic orchestrator; LLM judgment only at classifier + judge gates |
+| v0.10 | [ADR-0007](docs/adr/0007-two-layer-routing-not-a-router.md) two-layer model routing (predictive + reactive), not a router |
+| v0.11 | [ADR-0008](docs/adr/0008-telemetry-on-bcl-in-core.md) telemetry on BCL diagnostics in Core; the SDK only in the CLI · [ADR-0009](docs/adr/0009-readonly-subagents-by-structure.md) YOLO by default, but sub-agents scoped read-only by structure |
 
-`Cli/Program.cs` is wiring + a console observer + the REPL.
-`Storage.Sqlite/SqliteSessionStore.cs` is the optional SQLite backend.
-
-## Why it's split into projects
-
-So it grows toward the full Ratchet without a rewrite. Each seam is where a
-doc'd feature plugs in:
-
-- **`ILlmClient`** → provider-agnostic later (OpenAI, Copilot-as-provider). Also
-  what the handover generator calls — summarising is just another completion.
-- **`ITool`** → Roslyn navigation, MCP-backed tools, and `recall` all land here.
-- **`IAgentObserver`** → audit logging / TUI / ACP streaming hang off this.
-- **`BashTool` + `ShellSpec`** → shell is swappable (bash/cmd/pwsh) today; the
-  ConPTY upgrade replaces the `Process` plumbing inside this one class.
-- **`ISessionStore`** → persistence is a seam: `FileSessionStore` (JSON files)
-  and `SqliteSessionStore` (one DB, incremental inserts, recursive-CTE path
-  walks) both sit behind it. Pick with `RATCHET_STORE`; the loop never changes.
-  Core stays dependency-free — the SQLite adapter is a separate project.
-
-## What it deliberately does NOT do
+## 🚫 What it deliberately does NOT do
 
 Still no **silent in-place compaction**: the long-session answer remains *handover*,
 now also auto-triggered when context crosses `RATCHET_CONTEXT_LIMIT` (v0.7) — a
@@ -196,10 +378,12 @@ mutating tools (`bash`, `write`, `edit`, `git_commit`, `git_create_branch`, the 
 rename) require approval while read-only tools always pass.
 
 YOLO is for the *top-level* agent, which you drive directly — but a **delegated** sub-agent
-is scoped to its role regardless. The `explore` investigator now runs under a deny-by-default
+is scoped to its role regardless. The `explore` investigator runs under a deny-by-default
 `ReadOnlyGate` with only read-only tools (`read` + a real read-only `search`), so it
 **cannot** mutate even if prompted to — the constraint is enforced in the loop, not asked for
 in its prompt.
+
+## 📜 Version history
 
 > **v0.1 — streaming.** Responses stream over SSE: assistant text appears
 > token-by-token, and tool-call arguments are reassembled from `input_json_delta`
@@ -345,7 +529,21 @@ in its prompt.
 > metrics cover token usage, model + tool durations, tool calls, and gate denials. The
 > LLM-client span sits where the model name is known (`ChatClientLlm`, `AnthropicClient`); the
 > turn/tool/gate spans in the loop; the run/phase/gate spans in the scheduler — each on the seam
-> it belongs to, the loop itself still untouched.
+> it belongs to, the loop itself still untouched. This version also bundles the full-solution
+> review fixes and the read-only sub-agent scoping (`ReadOnlyGate` + a read-only `search`).
+
+## 🛠️ Technologies
+
+- **.NET 9 / C#** — `Ratchet.Core` is BCL-only by rule
+- **Anthropic Messages API** — hand-rolled wire client (JSON + SSE), the pedagogical core
+- **Microsoft.Extensions.AI** (`IChatClient`) — the provider-agnostic seam
+- **OpenAI-compatible wire** — one client for OpenRouter / OpenAI / Groq / local / any `/v1`
+- **Roslyn** (MSBuildWorkspace) — semantic C# tools
+- **Model Context Protocol (MCP)** — `.mcp.json` servers as tools
+- **Microsoft.Data.Sqlite** (+ FTS5) — the optional session store and `recall` index
+- **YamlDotNet** — workflow definitions
+- **OpenTelemetry** (GenAI semantic conventions) — traces + metrics, SDK wired in the CLI only
+- **Windows ConPTY** (P/Invoke) — opt-in pseudo-console for `bash`
 
 ## Namespacing
 
