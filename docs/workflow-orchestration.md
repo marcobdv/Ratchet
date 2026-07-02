@@ -451,10 +451,20 @@ regression, which is the exact failure the floors exist to prevent.
 The intended coverage for this control flow is a deterministic test harness (a
 scripted `ILlmClient` plus a real command gate) exercising classify → phases → judge
 loop-back → command-gate loop-back → escalation, alongside the loader-validation
-rules. **Partially in-tree** (v0.12 scaffold, `tests/Ratchet.Tests`): the
-loader-validation rules and the classifier's degradation ladder are covered
-(`WorkflowLoaderTests`, `ClassifierTests`); the scheduler harness (phases, loop-back,
-escalation) is still to come — until then those paths are exercised only by real runs.
+rules. **Partially in-tree** (v0.12, `tests/Ratchet.Tests`): the loader-validation
+rules, the classifier's degradation ladder, and classify → phase → judge loop-back
+(including the gate-failure feedback reaching the retry, and stale-resume rejection)
+are covered (`WorkflowLoaderTests`, `ClassifierTests`, `WorkflowSchedulerTests`);
+command-gate loop-back and escalation are still exercised only by real runs.
+
+**Loop-back carries the reason (v0.12).** A red gate no longer retries blind: the
+gate's failure reason (judge verdict text, or the command's exit + output tail) is
+injected into the re-run phase's prompt — the gated phase itself on `loop`, or the
+routed-to phase on a named `on_fail` (so `implement` sees `verify`'s build errors).
+The feedback is consumed by the next attempt and survives resume. Judge gates also
+now receive the actual working-tree diff (`git status` + `git diff HEAD`, capped)
+alongside the authored working-set, so merge-readiness is judged against ground
+truth rather than the driver's self-summary alone.
 
 **v0.9 additions.** Five things the design called for but v0.8 left open:
 

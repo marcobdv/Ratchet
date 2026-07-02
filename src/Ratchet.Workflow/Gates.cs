@@ -20,13 +20,17 @@ public static class Gates
 {
     public static async Task<GateOutcome> RunCommandAsync(string command, ShellSpec shell, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo { FileName = shell.FileName };
-        psi.ArgumentList.Add(shell.CommandFlag);
-        psi.ArgumentList.Add(command);
+        var psi = new ProcessStartInfo();
+        shell.Apply(psi, command);   // shell-correct quoting lives on ShellSpec
+
+        // Unattended runs can't Ctrl+C a hung gate (stalled NuGet restore, a test that
+        // never returns) — the deadline turns "wedged forever" into a red gate.
+        var timeout = TimeSpan.FromSeconds(
+            int.TryParse(Environment.GetEnvironmentVariable("RATCHET_GATE_TIMEOUT_SECS"), out var s) && s > 0 ? s : 600);
 
         int exitCode;
         string output;
-        try { (exitCode, output) = await ProcessRunner.RunAsync(psi, ct); }
+        try { (exitCode, output) = await ProcessRunner.RunAsync(psi, ct, timeout); }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) { return new GateOutcome(false, $"could not run gate command: {ex.Message}"); }
 
@@ -42,12 +46,20 @@ public static class Gates
     /// </summary>
     public static async Task<GateOutcome> RunJudgeAsync(
         ILlmClient judge, string judgeAgent, bool freshContext,
-        string task, string workingSet, string? transcript, CancellationToken ct)
+        string task, string workingSet, string? transcript, CancellationToken ct,
+        string? diff = null)
     {
         var system = JudgePrompts.For(judgeAgent);
         var user = new StringBuilder();
         user.Append("Task under review:\n").Append(task).Append("\n\n");
         user.Append("Authored working-set / artifact to judge:\n").Append(workingSet).Append("\n\n");
+        if (!string.IsNullOrWhiteSpace(diff))
+        {
+            // Ground truth: the summary above was authored by the driver being judged —
+            // judge the change itself, not the driver's account of it.
+            user.Append("Actual uncommitted change in the working tree (git status + diff — judge THIS, ")
+                .Append("not just the summary):\n").Append(diff).Append("\n\n");
+        }
         if (!freshContext && !string.IsNullOrWhiteSpace(transcript))
             user.Append("Full work transcript (for reference):\n").Append(transcript).Append("\n\n");
         user.Append("Decide. End your reply with exactly one line: 'VERDICT: pass' or 'VERDICT: fail', " +

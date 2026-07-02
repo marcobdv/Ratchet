@@ -127,8 +127,6 @@ exactly two points: a one-call **classifier** that sizes the task into a `work_t
 (which phase subset runs), and **judge gates** that spend a frontier model on
 merge-readiness an exit code can't express. **Command gates** route on a process exit
 code — the cheapest, strongest judge there is. Floors (`verify`, `review`) always run.
-(Known gap: the shipped `workflows/ratchet-dev.yaml` gates `verify` on `dotnet build`
-only — tests at the floor are designed but not yet wired in.)
 
 ```mermaid
 flowchart TB
@@ -140,7 +138,7 @@ flowchart TB
         R["research"] --> P["plan"] --> I["implement"] --> V["verify"] --> RV["review"] --> L["land"]
     end
 
-    V -. "command gate<br/>dotnet build" .-> VG{exit 0?}
+    V -. "command gate<br/>dotnet build + test" .-> VG{exit 0?}
     VG -- no --> I
     RV -. "judge gate<br/>frontier model" .-> RG{merge-ready?}
     RG -- no --> RV

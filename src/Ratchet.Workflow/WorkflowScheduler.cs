@@ -104,6 +104,7 @@ public sealed class WorkflowScheduler
         int idx, escalations;
         Dictionary<string, int> loopCounts, attempt;
         Dictionary<string, string> currentTier;   // reactive layer: each phase's promoted driver tier
+        Dictionary<string, string> gateFeedback;  // phase -> the gate reason its retry must address
         List<(string phase, string doc)> handoff;
         string? priorSession;
 
@@ -115,6 +116,7 @@ public sealed class WorkflowScheduler
             loopCounts = new Dictionary<string, int>(resume.LoopCounts, StringComparer.Ordinal);
             attempt = new Dictionary<string, int>(resume.Attempt, StringComparer.Ordinal);
             currentTier = new Dictionary<string, string>(resume.CurrentTier, StringComparer.Ordinal);
+            gateFeedback = new Dictionary<string, string>(resume.GateFeedback, StringComparer.Ordinal);
             escalations = resume.Escalations;
             handoff = resume.Handoff.Select(h => (h.Phase, h.Doc)).ToList();
             priorSession = resume.PriorSession;
@@ -137,6 +139,7 @@ public sealed class WorkflowScheduler
             loopCounts = new(StringComparer.Ordinal);
             attempt = new(StringComparer.Ordinal);
             currentTier = new(StringComparer.Ordinal);
+            gateFeedback = new(StringComparer.Ordinal);
             handoff = new();
             priorSession = null;
         }
@@ -162,6 +165,7 @@ public sealed class WorkflowScheduler
             Handoff = handoff.Select(h => new HandoffEntry { Phase = h.phase, Doc = h.doc }).ToList(),
             PriorSession = priorSession,
             CurrentTier = new Dictionary<string, string>(currentTier),
+            GateFeedback = new Dictionary<string, string>(gateFeedback),
             Events = run.Events.ToList(),
             Cost = run.Cost,
         });
@@ -175,7 +179,15 @@ public sealed class WorkflowScheduler
             Checkpoint("running");
 
             var phaseId = plan[idx];
-            var phase = _config.Phase(phaseId)!;
+            // Same class of resume hazard as the work_type guard above: a snapshot whose
+            // config renamed/removed a planned phase must fail gracefully, not NRE.
+            var phase = _config.Phase(phaseId);
+            if (phase is null)
+            {
+                run.RunEnd(RunStatus.Failed, $"phase '{phaseId}' is not defined in this workflow (renamed or removed?).");
+                Checkpoint("failed");
+                return run;
+            }
             attempt[phaseId] = attempt.GetValueOrDefault(phaseId) + 1;
 
             // PREDICTIVE tier: pick the starting tier for (phase, work_type) the first time we
@@ -183,7 +195,12 @@ public sealed class WorkflowScheduler
             if (!currentTier.ContainsKey(phaseId)) currentTier[phaseId] = _config.StartingTier(wt, phaseId);
             var driverTier = currentTier[phaseId];
 
-            var result = await RunPhaseAsync(phase, driverTier, workType, task, handoff, priorSession, run, ct);
+            // Consume any red-gate feedback aimed at this phase: the retry must know WHY
+            // the last attempt was rejected, or it will plausibly repeat it (the loop-back
+            // was otherwise blind — the only corrective force was tier promotion).
+            gateFeedback.Remove(phaseId, out var feedback);
+
+            var result = await RunPhaseAsync(phase, driverTier, workType, task, handoff, priorSession, feedback, run, ct);
 
             // Persist the phase transcript so the NEXT phase's `recall` can page into it.
             var sessionId = $"{_runId}.{phaseId}.{attempt[phaseId]}";
@@ -228,6 +245,13 @@ public sealed class WorkflowScheduler
             if (loopCounts[phaseId] > phase.Gate.MaxLoops)
             { run.RunEnd(RunStatus.Failed, $"{phaseId} gate exceeded max_loops ({phase.Gate.MaxLoops})"); Checkpoint("failed"); return run; }
 
+            // Hand the failure reason to whichever phase re-runs (the gated phase on
+            // "loop", the routed-to phase otherwise — e.g. implement gets verify's
+            // build errors). Consumed by that phase's next attempt.
+            var feedbackTarget = route == "loop" ? phaseId : route;
+            gateFeedback[feedbackTarget] =
+                $"The previous attempt was rejected by the `{phaseId}` {kind} gate. Reason:\n{outcome.Reason}";
+
             // REACTIVE promotion: a red gate means the work wasn't good enough, so promote the
             // driver of the phase that re-runs one rung up the ladder rather than retry at the
             // same tier (a stronger driver changes the work; consulting harder doesn't). Bounded
@@ -260,7 +284,7 @@ public sealed class WorkflowScheduler
     private async Task<PhaseResult> RunPhaseAsync(
         PhaseSpec phase, string driverTier, string workType, string task,
         IReadOnlyList<(string phase, string doc)> handoff, string? priorSession,
-        IWorkflowObserver run, CancellationToken ct)
+        string? gateFeedback, IWorkflowObserver run, CancellationToken ct)
     {
         using var phaseSpan = RatchetTelemetry.Activity.StartActivity($"phase {phase.Id}", ActivityKind.Internal);
         phaseSpan?.SetTag("ratchet.phase", phase.Id);
@@ -283,7 +307,7 @@ public sealed class WorkflowScheduler
         var conversation = new Conversation();
         conversation.Add(Message.UserText(task));
 
-        var systemPrompt = BuildPhasePrompt(phase, task, handoff, eligibleSkills, loadAll);
+        var systemPrompt = BuildPhasePrompt(phase, task, handoff, eligibleSkills, loadAll, gateFeedback);
         var tools = BuildPhaseTools(phase, conversation, consult, escalation, priorSession, run);
 
         var agent = new Agent(Client(driverTier), new ToolRegistry(tools), systemPrompt, _agentObserver, _gate);
@@ -294,12 +318,19 @@ public sealed class WorkflowScheduler
 
     private string BuildPhasePrompt(
         PhaseSpec phase, string task, IReadOnlyList<(string phase, string doc)> handoff,
-        IReadOnlyList<string> eligibleSkills, bool loadAll)
+        IReadOnlyList<string> eligibleSkills, bool loadAll, string? gateFeedback = null)
     {
         var sb = new StringBuilder();
         sb.Append("You are the `").Append(phase.Id).Append("` phase of an automated coding workflow.\n");
         sb.Append("Role: ").Append(phase.Role).Append("\n\n");
         sb.Append("Do only this phase's job, then stop and report what you did. A later gate will check it.\n");
+
+        if (!string.IsNullOrWhiteSpace(gateFeedback))
+        {
+            sb.Append("\n# A gate rejected the previous attempt — fix this first\n");
+            sb.Append(gateFeedback).Append('\n');
+            sb.Append("Address the rejection concretely; do not repeat the previous attempt unchanged.\n");
+        }
 
         if (handoff.Count > 0)
         {
@@ -381,15 +412,48 @@ public sealed class WorkflowScheduler
         var outcome = phase.Gate.Type switch
         {
             GateKind.Command => await Gates.RunCommandAsync(phase.Gate.Run!, _shell, ct),
+            // A judge must see the ground truth, not only the driver's self-summary —
+            // otherwise a driver that under-reports problems passes review structurally.
             GateKind.Judge => await Gates.RunJudgeAsync(
                 Client(phase.Gate.ModelTier!), phase.Gate.JudgeAgent!, phase.Gate.FreshContext,
-                task, doc, phase.Gate.FreshContext ? null : Flatten(convo), ct),
+                task, doc, phase.Gate.FreshContext ? null : Flatten(convo), ct,
+                diff: await TryGetGitDiffAsync(ct)),
             _ => new GateOutcome(true, ""),
         };
 
         gateSpan?.SetTag("ratchet.gate.pass", outcome.Pass);
         if (!outcome.Pass) gateSpan?.SetStatus(ActivityStatusCode.Error, "gate failed");
         return outcome;
+    }
+
+    /// <summary>
+    /// The working tree's uncommitted change (status + diff against HEAD), capped for a
+    /// judge prompt. Null when there is no git, no repo, or no change — the judge then
+    /// falls back to the authored working-set alone.
+    /// </summary>
+    private static async Task<string?> TryGetGitDiffAsync(CancellationToken ct)
+    {
+        static ProcessStartInfo Git(params string[] args)
+        {
+            var psi = new ProcessStartInfo { FileName = "git" };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+            return psi;
+        }
+
+        try
+        {
+            var (statusExit, status) = await ProcessRunner.RunAsync(
+                Git("status", "--short"), ct, timeout: TimeSpan.FromSeconds(30), maxOutputChars: 4_000);
+            if (statusExit != 0) return null;   // not a repo / git missing
+
+            var (_, diff) = await ProcessRunner.RunAsync(
+                Git("diff", "HEAD"), ct, timeout: TimeSpan.FromSeconds(30), maxOutputChars: 24_000);
+
+            var combined = (status.Trim() + "\n\n" + diff.Trim()).Trim();
+            return combined.Length == 0 ? null : combined;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
     }
 
     // ---- routing -----------------------------------------------------------

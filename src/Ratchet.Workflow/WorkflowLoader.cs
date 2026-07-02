@@ -140,6 +140,16 @@ public static class WorkflowLoader
 
         bool TierExists(string? t) => !string.IsNullOrEmpty(t) && c.Models.ContainsKey(t!);
 
+        // The classifier and any phase without an explicit driver resolve through
+        // defaults.driver — an absent/typoed value used to surface as a raw
+        // KeyNotFoundException at classify time instead of a load error.
+        if (!TierExists(c.DefaultDriverTier))
+            e.Add(string.IsNullOrEmpty(c.DefaultDriverTier)
+                ? "defaults.driver is missing."
+                : $"defaults.driver '{c.DefaultDriverTier}' is not a defined model.");
+        if (c.DefaultAdvisor is not null && !TierExists(c.DefaultAdvisor.ModelTier))
+            e.Add($"defaults.advisor.model '{c.DefaultAdvisor.ModelTier}' is not a defined model.");
+
         var spineIds = new HashSet<string>(c.Spine.Select(p => p.Id), StringComparer.Ordinal);
         if (c.Spine.Select(p => p.Id).Distinct(StringComparer.Ordinal).Count() != c.Spine.Count)
             e.Add("spine has duplicate phase ids.");

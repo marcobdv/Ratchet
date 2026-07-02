@@ -38,6 +38,7 @@ public sealed class RunSnapshot
     public List<HandoffEntry> Handoff { get; set; } = new();
     public string? PriorSession { get; set; }
     public Dictionary<string, string> CurrentTier { get; set; } = new();   // reactive-layer promotions
+    public Dictionary<string, string> GateFeedback { get; set; } = new();  // phase -> why its last gate went red
 
     // ---- recording ----
     public List<RunEvent> Events { get; set; } = new();

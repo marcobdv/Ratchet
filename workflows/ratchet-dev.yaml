@@ -75,8 +75,10 @@ spine:
     role: "Prove it: build and tests are green."
     driver: driver_cheap
     advisor: null               # tests are the judge; no model needed
-    tools: [bash, read]
-    gate: { type: command, run: "dotnet build -clp:ErrorsOnly", on_fail: implement, max_loops: 3 }
+    tools: [bash, read, run_tests]
+    # Build fast-fails with clean errors, then the suite actually runs — the floor the
+    # whole design stakes its identity on ("a workflow that always runs the tests").
+    gate: { type: command, run: "dotnet build -clp:ErrorsOnly && dotnet test --nologo", on_fail: implement, max_loops: 3 }
 
   - id: review
     skippable: false            # FLOOR — merge-readiness

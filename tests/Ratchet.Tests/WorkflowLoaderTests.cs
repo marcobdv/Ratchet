@@ -219,12 +219,11 @@ public sealed class WorkflowLoaderTests
     public void GarbageYaml_ThrowsWorkflowConfigException_NotYamlDotNetInternals() =>
         Assert.Throws<WorkflowConfigException>(() => WorkflowLoader.Parse("spine: ["));
 
-    [Fact(Skip = "Known gap (review 2026-07, workflow M4): defaults.driver is never " +
-                 "validated. When every spine phase sets driver: explicitly and " +
-                 "defaults.driver is absent, loading succeeds but the classifier crashes " +
-                 "at runtime with KeyNotFoundException on the empty tier name.")]
+    [Fact]
     public void MissingDefaultsDriver_IsRejectedAtLoadTime()
     {
+        // Even with every phase driver explicit, the classifier resolves through
+        // defaults.driver — absent used to be a KeyNotFoundException at classify time.
         AssertRejects("""
             version: 1
             name: t
@@ -235,6 +234,14 @@ public sealed class WorkflowLoaderTests
             work_types:
               t: { phases: [verify] }
             """, "defaults.driver");
+    }
+
+    [Fact]
+    public void TypoedDefaultsAdvisorModel_IsRejectedAtLoadTime()
+    {
+        AssertRejects(ValidYaml.Replace("defaults:\n  driver: cheap",
+            "defaults:\n  driver: cheap\n  advisor: { model: warp9 }"),
+            "defaults.advisor.model 'warp9'");
     }
 
     [Fact]
