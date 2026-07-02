@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using CodeStack.Ratchet.Core;
 using Microsoft.Extensions.AI;
 
 namespace CodeStack.Ratchet.Llm;
@@ -27,7 +28,9 @@ public sealed class AnthropicChatClient : IChatClient
     {
         _model = model;
         _maxTokens = maxTokens;
-        _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        // No overall deadline for streaming; liveness comes from the per-read idle
+        // guard (LlmWire.IdleTimeout) and the caller's CancellationToken.
+        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _http.DefaultRequestHeaders.Add("x-api-key", apiKey);
         _http.DefaultRequestHeaders.Add("anthropic-version", ApiVersion);
     }
@@ -38,18 +41,14 @@ public sealed class AnthropicChatClient : IChatClient
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var requestJson = BuildRequestJson(messages, options);
-        using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
-        {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
-        };
 
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-            .ConfigureAwait(false);
-        if (!resp.IsSuccessStatusCode)
-        {
-            var err = await resp.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {err}");
-        }
+        // Retry/backoff for retryable statuses + network errors; typed LlmException otherwise.
+        using var resp = await LlmWire.SendWithRetryAsync(_http,
+            () => new HttpRequestMessage(HttpMethod.Post, Endpoint)
+            {
+                Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
+            },
+            "anthropic", cancellationToken).ConfigureAwait(false);
 
         await using var stream = await resp.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         using var reader = new StreamReader(stream);
@@ -57,9 +56,11 @@ public sealed class AnthropicChatClient : IChatClient
         var toolBuilders = new SortedDictionary<int, ToolBuilder>();
         long inputTokens = 0, outputTokens = 0;
         var stopReason = "end_turn";
+        var completed = false; // saw message_stop — anything less is a truncated stream
 
+        using var idle = LlmWire.StartIdleGuard(cancellationToken);
         string? line;
-        while ((line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
+        while ((line = await LlmWire.ReadLineAsync(reader, idle, cancellationToken).ConfigureAwait(false)) is not null)
         {
             if (line.Length == 0 || !line.StartsWith("data:", StringComparison.Ordinal))
                 continue;
@@ -124,12 +125,24 @@ public sealed class AnthropicChatClient : IChatClient
                         outputTokens = ot.GetInt32();
                     break;
 
+                case "message_stop":
+                    completed = true;
+                    break;
+
                 case "error":
                     var msg = root.TryGetProperty("error", out var e) && e.TryGetProperty("message", out var em)
                         ? em.GetString() : "unknown streaming error";
-                    throw new InvalidOperationException($"Anthropic stream error: {msg}");
+                    var errType = root.TryGetProperty("error", out var e2) &&
+                                  e2.TryGetProperty("type", out var et) && et.ValueKind == JsonValueKind.String
+                        ? et.GetString() : null;
+                    throw new LlmException($"Anthropic stream error: {msg}",
+                        statusCode: null, errorType: errType, retryable: errType == "overloaded_error");
             }
         }
+
+        if (!completed)
+            throw new LlmStreamInterruptedException(
+                "stream ended before message_stop — the response is incomplete (dropped connection?).");
 
         // Final update: any tool calls, the finish reason, and usage.
         var finalContents = new List<AIContent>();
@@ -308,8 +321,10 @@ public sealed class AnthropicChatClient : IChatClient
     };
 
     private static ChatFinishReason MapFinishReason(string stopReason, bool hasToolCalls) =>
-        hasToolCalls || stopReason == "tool_use" ? ChatFinishReason.ToolCalls
-        : stopReason == "max_tokens" ? ChatFinishReason.Length
+        // The real stop reason wins: max_tokens with tool calls present is still a
+        // truncation, and hiding it behind ToolCalls poisons the transcript upstream.
+        stopReason == "max_tokens" ? ChatFinishReason.Length
+        : hasToolCalls || stopReason == "tool_use" ? ChatFinishReason.ToolCalls
         : ChatFinishReason.Stop;
 
     private static int UsageInt(JsonElement usage, string prop) =>

@@ -30,7 +30,10 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
     {
         _model = model;
         _maxTokens = maxTokens;
-        _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        // Streaming responses have no meaningful overall deadline — a long turn is
+        // legitimate. Liveness is guarded per-read (LlmWire.IdleTimeout) and by the
+        // caller's CancellationToken, not by a wall-clock cap that kills slow turns.
+        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _http.DefaultRequestHeaders.Add("x-api-key", apiKey);
         _http.DefaultRequestHeaders.Add("anthropic-version", ApiVersion);
     }
@@ -48,19 +51,17 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         try
         {
             var requestJson = BuildRequestJson(systemPrompt, conversation, tools);
-            using var req = new HttpRequestMessage(HttpMethod.Post, Endpoint)
-            {
-                Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
-            };
 
-            // ResponseHeadersRead: start reading the body as it arrives instead of
-            // buffering the whole response — that's what makes streaming "live".
-            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-            if (!resp.IsSuccessStatusCode)
-            {
-                var err = await resp.Content.ReadAsStringAsync(ct);
-                throw new InvalidOperationException($"Anthropic API {(int)resp.StatusCode}: {err}");
-            }
+            // Send with retry/backoff (429/5xx/overloaded/network — see LlmWire); a
+            // non-retryable status surfaces as a typed LlmException. ResponseHeadersRead:
+            // start reading the body as it arrives instead of buffering the whole
+            // response — that's what makes streaming "live".
+            using var resp = await LlmWire.SendWithRetryAsync(_http,
+                () => new HttpRequestMessage(HttpMethod.Post, Endpoint)
+                {
+                    Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
+                },
+                "anthropic", ct);
 
             await using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var reader = new StreamReader(stream);
@@ -98,15 +99,19 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         // turn, so cache them; and put a breakpoint at the end of the transcript so
         // the conversation prefix is cached and re-read instead of re-billed each
         // turn. The API ignores breakpoints under the cache minimum, so this is safe
-        // to always emit. See CacheControl.Write.
-        w.WritePropertyName("system");
-        w.WriteStartArray();
-        w.WriteStartObject();
-        w.WriteString("type", "text");
-        w.WriteString("text", systemPrompt);
-        CacheControl.Write(w);
-        w.WriteEndObject();
-        w.WriteEndArray();
+        // to always emit. See CacheControl.Write. Only emit the system array when
+        // non-empty: the API rejects an empty text content block (400).
+        if (systemPrompt.Length > 0)
+        {
+            w.WritePropertyName("system");
+            w.WriteStartArray();
+            w.WriteStartObject();
+            w.WriteString("type", "text");
+            w.WriteString("text", systemPrompt);
+            CacheControl.Write(w);
+            w.WriteEndObject();
+            w.WriteEndArray();
+        }
 
         WriteTools(w, tools);
         WriteMessages(w, conversation);
@@ -214,9 +219,11 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         var builders = new SortedDictionary<int, BlockBuilder>();
         int inputTokens = 0, outputTokens = 0;
         var stopReason = "end_turn";
+        var completed = false; // saw message_stop — anything less is a truncated stream
 
+        using var idle = LlmWire.StartIdleGuard(ct);
         string? line;
-        while ((line = await reader.ReadLineAsync(ct)) is not null)
+        while ((line = await LlmWire.ReadLineAsync(reader, idle, ct)) is not null)
         {
             // SSE: events are separated by blank lines; we only need the data: rows.
             if (line.Length == 0 || line.StartsWith("event:", StringComparison.Ordinal))
@@ -288,15 +295,27 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                         outputTokens = ot.GetInt32();
                     break;
 
+                case "message_stop":
+                    completed = true;
+                    break;
+
                 case "error":
                     var msg = root.TryGetProperty("error", out var e) &&
                               e.TryGetProperty("message", out var em)
                         ? em.GetString() : "unknown streaming error";
-                    throw new InvalidOperationException($"Anthropic stream error: {msg}");
+                    var errType = root.TryGetProperty("error", out var e2) &&
+                                  e2.TryGetProperty("type", out var et) && et.ValueKind == JsonValueKind.String
+                        ? et.GetString() : null;
+                    throw new LlmException($"Anthropic stream error: {msg}",
+                        statusCode: null, errorType: errType, retryable: errType == "overloaded_error");
 
-                // content_block_stop / message_stop / ping: nothing to do.
+                // content_block_stop / ping: nothing to do.
             }
         }
+
+        if (!completed)
+            throw new LlmStreamInterruptedException(
+                "stream ended before message_stop — the response is incomplete (dropped connection?).");
 
         var blocks = new List<ContentBlock>(builders.Count);
         foreach (var b in builders.Values)

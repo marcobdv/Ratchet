@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using CodeStack.Ratchet.Core;
 using Microsoft.Extensions.AI;
 
 namespace CodeStack.Ratchet.Llm;
@@ -34,7 +35,9 @@ public sealed class OpenAiChatClient : IChatClient
         _model = model;
         _maxTokens = maxTokens;
         _endpoint = baseUrl.TrimEnd('/') + "/chat/completions";
-        _http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        // No overall deadline for streaming; liveness comes from the per-read idle
+        // guard (LlmWire.IdleTimeout) and the caller's CancellationToken.
+        _http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         if (!string.IsNullOrWhiteSpace(apiKey))
             _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         if (extraHeaders is not null)
@@ -48,33 +51,31 @@ public sealed class OpenAiChatClient : IChatClient
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var requestJson = BuildRequestJson(messages, options);
-        using var req = new HttpRequestMessage(HttpMethod.Post, _endpoint)
-        {
-            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
-        };
 
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-            .ConfigureAwait(false);
-        if (!resp.IsSuccessStatusCode)
-        {
-            var err = await resp.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            throw new InvalidOperationException($"OpenAI API {(int)resp.StatusCode}: {err}");
-        }
+        // Retry/backoff for retryable statuses + network errors; typed LlmException otherwise.
+        using var resp = await LlmWire.SendWithRetryAsync(_http,
+            () => new HttpRequestMessage(HttpMethod.Post, _endpoint)
+            {
+                Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
+            },
+            "openai", cancellationToken).ConfigureAwait(false);
 
         await using var stream = await resp.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         using var reader = new StreamReader(stream);
 
         var toolBuilders = new SortedDictionary<int, ToolBuilder>();
         long inputTokens = 0, outputTokens = 0;
-        var finish = "stop";
+        string? finish = null; // a finish_reason (or [DONE]) marks the stream complete
 
+        using var idle = LlmWire.StartIdleGuard(cancellationToken);
+        var sawDone = false;
         string? line;
-        while ((line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
+        while ((line = await LlmWire.ReadLineAsync(reader, idle, cancellationToken).ConfigureAwait(false)) is not null)
         {
             if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
             var payload = line.AsSpan(5).Trim();
             if (payload.IsEmpty) continue;
-            if (payload.SequenceEqual("[DONE]")) break;
+            if (payload.SequenceEqual("[DONE]")) { sawDone = true; break; }
 
             using var doc = JsonDocument.Parse(payload.ToString());
             var root = doc.RootElement;
@@ -117,6 +118,13 @@ public sealed class OpenAiChatClient : IChatClient
                 }
             }
         }
+
+        // A stream that ends without [DONE] and without ever reporting a finish_reason
+        // was cut off — surfacing it as success would silently truncate the answer.
+        // (finish==null is tolerated with [DONE] for servers that omit finish_reason.)
+        if (!sawDone && finish is null)
+            throw new LlmStreamInterruptedException(
+                "stream ended before [DONE]/finish_reason — the response is incomplete (dropped connection?).");
 
         var finalContents = new List<AIContent>();
         foreach (var (idx, tb) in toolBuilders)

@@ -96,14 +96,16 @@ public sealed class AnthropicSseTests
     }
 
     [Fact]
-    public async Task ErrorEvent_Throws_WithTheApiMessage()
+    public async Task ErrorEvent_Throws_Typed_WithTheApiMessage()
     {
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Consume("""
+        var ex = await Assert.ThrowsAsync<LlmException>(() => Consume("""
             data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
             data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 
             """));
         Assert.Contains("Overloaded", ex.Message);
+        Assert.Equal("overloaded_error", ex.ErrorType);
+        Assert.True(ex.Retryable);
     }
 
     [Fact]
@@ -126,18 +128,27 @@ public sealed class AnthropicSseTests
             response.AssistantMessage.Content.Cast<TextBlock>().Select(t => t.Text));
     }
 
-    [Fact(Skip = "Known bug (review 2026-07, llm C1): a stream that ends before " +
-                 "message_stop (dropped connection, proxy timeout) is returned as a " +
-                 "successful end_turn completion with the partial text — silent truncation. " +
-                 "Premature end-of-stream must throw.")]
-    public async Task TruncatedStream_MustThrow_NotReportSuccess()
+    [Fact]
+    public async Task TruncatedStream_Throws_NotReportsSuccess()
     {
-        // Cut cleanly between events (no message_delta / message_stop ever arrives) —
-        // the case a dropped connection produces and the parser currently reports as success.
-        await Assert.ThrowsAnyAsync<Exception>(() => Consume("""
+        // Cut cleanly between events (no message_stop ever arrives) — the case a
+        // dropped connection produces. Must surface as an interruption, not a
+        // short-but-successful answer.
+        await Assert.ThrowsAsync<LlmStreamInterruptedException>(() => Consume("""
             data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
             data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
             data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an answer"}}
+
+            """));
+    }
+
+    [Fact]
+    public async Task StreamCutAfterMessageDeltaButBeforeMessageStop_StillThrows()
+    {
+        await Assert.ThrowsAsync<LlmStreamInterruptedException>(() => Consume("""
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"almost done"}}
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
 
             """));
     }

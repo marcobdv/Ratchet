@@ -53,9 +53,11 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
             var text = new StringBuilder();
             var toolCalls = new List<FunctionCallContent>();
             long inputTokens = 0, outputTokens = 0;
+            ChatFinishReason? finishReason = null;
 
             await foreach (var update in _chat.GetStreamingResponseAsync(messages, options, ct).ConfigureAwait(false))
             {
+                if (update.FinishReason is { } fr) finishReason = fr;
                 foreach (var content in update.Contents)
                 {
                     switch (content)
@@ -84,7 +86,16 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
                 blocks.Add(new ToolUseBlock(call.CallId, call.Name, argsJson));
             }
 
-            var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+            // Map the provider's finish reason instead of inferring success: max_tokens
+            // truncation must be visible to the loop, not disguised as a clean end_turn.
+            var stopReason = finishReason switch
+            {
+                { } fr when fr == ChatFinishReason.Length => "max_tokens",
+                { } fr when fr == ChatFinishReason.ToolCalls => "tool_use",
+                { } fr when fr == ChatFinishReason.ContentFilter => "refusal",
+                { } fr when fr == ChatFinishReason.Stop => toolCalls.Count > 0 ? "tool_use" : "end_turn",
+                _ => toolCalls.Count > 0 ? "tool_use" : "end_turn",
+            };
             RatchetTelemetry.RecordChatResult(span, _system, _model, (int)inputTokens, (int)outputTokens,
                 Stopwatch.GetElapsedTime(started).TotalSeconds, stopReason);
 
