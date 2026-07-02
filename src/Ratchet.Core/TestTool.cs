@@ -52,12 +52,28 @@ public sealed class TestTool : ITool
         return Summarize(command, output, exitCode);
     }
 
-    private static string Summarize(string command, string raw, int exitCode)
+    internal static string Summarize(string command, string raw, int exitCode)
     {
+        // A multi-project `dotnet test` prints one summary line per project; sum the
+        // counts across all of them (first-match-only under-reported and could disagree
+        // with the exit-code verdict).
+        // Only lines carrying BOTH "Failed:" and "Passed:" are summary lines, so an
+        // incidental "connection failed: 3" in the log can't inflate the failure count.
+        var summaryLines = raw.Split('\n')
+            .Where(l => Regex.IsMatch(l, @"Failed:\s*\d+", RegexOptions.IgnoreCase)
+                     && Regex.IsMatch(l, @"Passed:\s*\d+", RegexOptions.IgnoreCase))
+            .ToList();
+
         int? Count(string label)
         {
-            var m = Regex.Match(raw, label + @":\s*(\d+)", RegexOptions.IgnoreCase);
-            return m.Success ? int.Parse(m.Groups[1].Value) : null;
+            if (summaryLines.Count == 0) return null;
+            var total = 0; var found = false;
+            foreach (var line in summaryLines)
+            {
+                var m = Regex.Match(line, label + @"!?:\s*(\d+)", RegexOptions.IgnoreCase);
+                if (m.Success) { total += int.Parse(m.Groups[1].Value); found = true; }
+            }
+            return found ? total : null;
         }
 
         var failed = Count("Failed");

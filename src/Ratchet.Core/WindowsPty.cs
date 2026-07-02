@@ -27,7 +27,7 @@ internal static class WindowsPty
     {
         if (!IsSupported) throw new PlatformNotSupportedException("ConPTY is Windows-only.");
 
-        IntPtr hPC = IntPtr.Zero, attrList = IntPtr.Zero;
+        IntPtr hPC = IntPtr.Zero, attrList = IntPtr.Zero, hJob = IntPtr.Zero;
         IntPtr inRead = IntPtr.Zero, inWrite = IntPtr.Zero, outRead = IntPtr.Zero, outWrite = IntPtr.Zero;
         var procInfo = new PROCESS_INFORMATION();
         CancellationTokenRegistration reg = default;
@@ -36,6 +36,13 @@ internal static class WindowsPty
         {
             if (!CreatePipe(out inRead, out inWrite, IntPtr.Zero, 0)) ThrowLast("CreatePipe(in)");
             if (!CreatePipe(out outRead, out outWrite, IntPtr.Zero, 0)) ThrowLast("CreatePipe(out)");
+
+            // Job object with KILL_ON_JOB_CLOSE: the child and everything it spawns
+            // (the actual build/test the shell launches) belong to the job, so closing
+            // it on cancel kills the WHOLE tree — TerminateProcess on the shell alone
+            // left grandchildren orphaned (the redirected-Process path already tree-kills).
+            hJob = CreateJobObject(IntPtr.Zero, null);
+            if (hJob != IntPtr.Zero) ConfigureKillOnClose(hJob);
 
             // COORD is two shorts packed into one DWORD (X = low word, Y = high word).
             // Passing it as a packed uint sidesteps small-struct by-value marshalling
@@ -53,8 +60,13 @@ internal static class WindowsPty
             si.lpAttributeList = attrList;
 
             if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
-                    EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out procInfo))
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out procInfo))
                 ThrowLast("CreateProcess");
+
+            // Assign to the job BEFORE the process runs (created suspended), so any
+            // child it spawns is captured too, then release it.
+            if (hJob != IntPtr.Zero) AssignProcessToJobObject(hJob, procInfo.hProcess);
+            ResumeThread(procInfo.hThread);
 
             // Close our copies of the PTY-end handles ONLY after the child is created
             // and attached — closing them earlier severs the pseudo-console. After this
@@ -63,8 +75,15 @@ internal static class WindowsPty
             CloseHandle(inRead); inRead = IntPtr.Zero;
             CloseHandle(outWrite); outWrite = IntPtr.Zero;
 
-            // If the caller cancels, terminate the child so the read loop can finish.
-            reg = ct.Register(() => { try { TerminateProcess(procInfo.hProcess, 1); } catch { /* best effort */ } });
+            // If the caller cancels, close the job to kill the whole tree (falling back to
+            // TerminateProcess if the job wasn't created) so the read loop can finish.
+            var jobForCancel = hJob;
+            var procForCancel = procInfo.hProcess;
+            reg = ct.Register(() =>
+            {
+                try { if (jobForCancel != IntPtr.Zero) CloseHandle(jobForCancel); else TerminateProcess(procForCancel, 1); }
+                catch { /* best effort */ }
+            });
 
             // Read the output pipe to EOF on a background thread. EOF arrives once we
             // close the pseudo-console (below), after the child has exited.
@@ -83,9 +102,18 @@ internal static class WindowsPty
             ClosePseudoConsole(hPC); hPC = IntPtr.Zero;
 
             var bytes = await readTask.ConfigureAwait(false);
-            GetExitCodeProcess(procInfo.hProcess, out var exit);
 
-            return ((int)exit, Vt.Strip(Encoding.UTF8.GetString(bytes)));
+            // Cancellation is a cancellation, not a completed command: propagate it rather
+            // than returning partial output that looks like a finished run.
+            ct.ThrowIfCancellationRequested();
+
+            // The exit code is only meaningful once the process has actually exited; after a
+            // kill the handle can still read STILL_ACTIVE (259). Wait briefly so we report a
+            // real code, not a phantom one.
+            if (WaitForSingleObject(procInfo.hProcess, 2000) != WAIT_TIMEOUT &&
+                GetExitCodeProcess(procInfo.hProcess, out var exit))
+                return ((int)exit, Vt.Strip(Encoding.UTF8.GetString(bytes)));
+            return (-1, Vt.Strip(Encoding.UTF8.GetString(bytes)));
         }
         finally
         {
@@ -98,7 +126,22 @@ internal static class WindowsPty
             if (outWrite != IntPtr.Zero) CloseHandle(outWrite);
             if (procInfo.hThread != IntPtr.Zero) CloseHandle(procInfo.hThread);
             if (procInfo.hProcess != IntPtr.Zero) CloseHandle(procInfo.hProcess);
+            if (hJob != IntPtr.Zero) CloseHandle(hJob);   // also kill-on-close: reaps any stragglers
         }
+    }
+
+    private static void ConfigureKillOnClose(IntPtr hJob)
+    {
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        var len = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        var ptr = Marshal.AllocHGlobal(len);
+        try
+        {
+            Marshal.StructureToPtr(info, ptr, false);
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, ptr, (uint)len);
+        }
+        finally { Marshal.FreeHGlobal(ptr); }
     }
 
     private sealed class Counter { public long Value; }
@@ -173,8 +216,37 @@ internal static class WindowsPty
 
     // ---- constants --------------------------------------------------------
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint CREATE_SUSPENDED = 0x00000004;
     private static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;
     private const uint WAIT_TIMEOUT = 0x00000102;
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
 
     // ---- structs ----------------------------------------------------------
     [StructLayout(LayoutKind.Sequential)]
@@ -240,6 +312,18 @@ internal static class WindowsPty
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr hThread);
 }
 
 /// <summary>Strips the VT/ANSI escape sequences a pseudo-console emits, leaving plain text.</summary>

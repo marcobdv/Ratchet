@@ -52,7 +52,7 @@ public static class McpToolset
 
                 var tools = await client.ListToolsAsync(cancellationToken: timeout.Token).ConfigureAwait(false);
                 foreach (var tool in tools)
-                    connections.Tools.Add(new McpToolAdapter(tool));
+                    connections.Tools.Add(new McpToolAdapter(name, tool));
 
                 log($"mcp: connected '{name}' ({tools.Count} tool(s): {string.Join(", ", tools.Select(t => t.Name).Take(8))})");
             }
@@ -120,11 +120,22 @@ internal sealed class McpToolAdapter : ITool
 {
     private readonly McpClientTool _tool;
 
-    public McpToolAdapter(McpClientTool tool) => _tool = tool;
+    public McpToolAdapter(string serverName, McpClientTool tool)
+    {
+        _tool = tool;
+        // Namespace the tool so two servers (or a server + a builtin) can't collide on a
+        // bare name and crash the registry at startup: mcp__<server>__<tool>, sanitized to
+        // the tool-name charset. Invocation still goes through _tool, so the wire name is
+        // untouched — only the name the model sees and the registry keys on changes.
+        Name = $"mcp__{Sanitize(serverName)}__{Sanitize(tool.Name)}";
+    }
 
-    public string Name => _tool.Name;
+    public string Name { get; }
     public string Description => _tool.Description ?? "";
     public string InputSchemaJson => _tool.JsonSchema.GetRawText();
+
+    private static string Sanitize(string s) =>
+        new string(s.Select(c => char.IsLetterOrDigit(c) || c is '_' or '-' ? c : '_').ToArray());
 
     public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
     {
@@ -132,7 +143,10 @@ internal sealed class McpToolAdapter : ITool
             ? new Dictionary<string, object?>()
             : JsonSerializer.Deserialize<Dictionary<string, object?>>(inputJson) ?? new Dictionary<string, object?>();
 
-        var result = await _tool.InvokeAsync(new AIFunctionArguments(args), ct).ConfigureAwait(false);
+        // A wedged server must not hang the turn forever; bound the call.
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(120));
+        var result = await _tool.InvokeAsync(new AIFunctionArguments(args), timeout.Token).ConfigureAwait(false);
         return result switch
         {
             null => "",

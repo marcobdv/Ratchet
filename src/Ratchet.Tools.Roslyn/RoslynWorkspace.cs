@@ -117,22 +117,31 @@ public sealed class RoslynWorkspace : IDisposable
 
     public bool TryApplyChanges(Solution solution) => _workspace?.TryApplyChanges(solution) ?? false;
 
-    /// <summary>Newest *.cs write-time under the dir (ignoring obj/bin). On error, returns "now" to force a reload.</summary>
+    /// <summary>
+    /// A stamp that changes whenever the workspace's inputs do, so a reload is skipped
+    /// only when nothing relevant moved. Covers source AND project/build files — editing
+    /// a .csproj (adding a PackageReference) then running diagnostics used to serve
+    /// stale results because the stamp watched *.cs only. Folds in the file COUNT so a
+    /// deletion (which lowers no surviving file's write-time) still invalidates.
+    /// On error, returns "now" to force a reload. Ignores obj/bin.
+    /// </summary>
     private static long LatestSourceStamp(string dir)
     {
         try
         {
-            long max = 0;
+            long max = 0, count = 0;
             var skip = $"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}";
             var skip2 = $"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}";
-            foreach (var f in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
-            {
-                if (f.Contains(skip, StringComparison.OrdinalIgnoreCase) || f.Contains(skip2, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                var t = File.GetLastWriteTimeUtc(f).Ticks;
-                if (t > max) max = t;
-            }
-            return max;
+            foreach (var pattern in new[] { "*.cs", "*.csproj", "*.props", "*.targets", "*.sln" })
+                foreach (var f in Directory.EnumerateFiles(dir, pattern, SearchOption.AllDirectories))
+                {
+                    if (f.Contains(skip, StringComparison.OrdinalIgnoreCase) || f.Contains(skip2, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    count++;
+                    var t = File.GetLastWriteTimeUtc(f).Ticks;
+                    if (t > max) max = t;
+                }
+            return max ^ unchecked((long)((ulong)count * 0x9E3779B97F4A7C15));   // mix count in so deletions invalidate
         }
         catch { return DateTime.UtcNow.Ticks; }
     }
