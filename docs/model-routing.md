@@ -228,5 +228,7 @@ promotion shows up in the run's cost breakdown for free.
 Intended verification (a deterministic harness on a scripted `ILlmClient`): loader
 rejects bad ladder / override tiers, a per-`work_type` override sets the starting tier,
 a red gate promotes the driver one rung and logs the promotion, the promoted tier
-survives a resume, and `promote: false` loops without climbing. **Not yet in-tree** —
-planned for the v0.12 test scaffold.
+survives a resume, and `promote: false` loops without climbing. **Partially in-tree**
+(v0.12 scaffold, `WorkflowLoaderTests`): the loader ladder/override rules, starting-tier
+resolution, and `PromoteTier`'s climb-and-stick behaviour are covered; the runtime
+pieces (promotion on a red gate, survival across resume) are still to come.

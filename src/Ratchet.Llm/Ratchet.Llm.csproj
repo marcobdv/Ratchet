@@ -19,4 +19,10 @@
     <ProjectReference Include="..\Ratchet.Core\Ratchet.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The SSE parser (ConsumeStreamAsync) is tested directly against canned
+         event streams; internal rather than public because it is not a seam. -->
+    <InternalsVisibleTo Include="Ratchet.Tests" />
+  </ItemGroup>
+
 </Project>

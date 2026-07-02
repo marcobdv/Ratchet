@@ -208,7 +208,7 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
     /// Text deltas are emitted live; tool-call arguments arrive as JSON fragments
     /// that we concatenate per block index, then parse as a whole at the end.
     /// </summary>
-    private static async Task<LlmResponse> ConsumeStreamAsync(
+    internal static async Task<LlmResponse> ConsumeStreamAsync(
         StreamReader reader, Action<string> onTextDelta, CancellationToken ct)
     {
         var builders = new SortedDictionary<int, BlockBuilder>();

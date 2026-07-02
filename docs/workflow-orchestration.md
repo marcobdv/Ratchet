@@ -450,9 +450,11 @@ regression, which is the exact failure the floors exist to prevent.
 
 The intended coverage for this control flow is a deterministic test harness (a
 scripted `ILlmClient` plus a real command gate) exercising classify → phases → judge
-loop-back → command-gate loop-back → escalation, alongside the four loader-validation
-rules. **Not yet in-tree** — this lands with the v0.12 test scaffold; until then these
-paths are exercised only by real runs.
+loop-back → command-gate loop-back → escalation, alongside the loader-validation
+rules. **Partially in-tree** (v0.12 scaffold, `tests/Ratchet.Tests`): the
+loader-validation rules and the classifier's degradation ladder are covered
+(`WorkflowLoaderTests`, `ClassifierTests`); the scheduler harness (phases, loop-back,
+escalation) is still to come — until then those paths are exercised only by real runs.
 
 **v0.9 additions.** Five things the design called for but v0.8 left open:
 
@@ -474,7 +476,9 @@ paths are exercised only by real runs.
 The intended verification is a second deterministic harness (gate allow/deny in the
 loop, run store roundtrip, cost tally across a full run, interrupt → checkpoint →
 resume, and a real `git_commit` both succeeding and being blocked by a deny gate).
-**Not yet in-tree** — planned for the v0.12 test scaffold.
+**Partially in-tree** (v0.12 scaffold): gate allow/deny enforcement in the loop is
+covered (`AgentLoopTests`); run store roundtrip, cost tally, resume, and the gated
+`git_commit` are still to come.
 
 **Note on `pass_on`.** The illustrative gate YAML above shows `pass_on: exit_zero`, but the
 implementation only ever passes a command gate on exit 0, so `pass_on` was a no-op and has
