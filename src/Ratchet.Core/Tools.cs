@@ -48,13 +48,30 @@ public sealed class ReadTool : ITool
     {
         var path = Json.GetString(inputJson, "path");
         if (!File.Exists(path)) return $"No file at '{path}'.";
-        var text = await File.ReadAllTextAsync(path, ct);
+
+        var bytes = await File.ReadAllBytesAsync(path, ct);
+        if (FileText.LooksBinary(bytes))
+            return $"'{path}' looks binary ({bytes.Length:N0} bytes) — not showing its content.";
+
+        string text;
+        try { (text, _) = FileText.Decode(bytes); }
+        catch (System.Text.DecoderFallbackException)
+        {
+            // Unknown legacy encoding: degrade to a lossy read so the model can still
+            // look, but don't mark it known — editing it would corrupt those bytes.
+            text = System.Text.Encoding.UTF8.GetString(bytes);
+            return $"(note: '{path}' is not valid UTF-8 — shown lossily; editing is disabled)\n" + Truncate(text);
+        }
+
         _access?.MarkKnown(path);
         if (text.Length == 0) return "(file is empty)";
-        return text.Length <= MaxBytes
+        return Truncate(text);
+    }
+
+    private static string Truncate(string text) =>
+        text.Length <= MaxBytes
             ? text
             : text[..MaxBytes] + $"\n\n…(truncated: showing {MaxBytes} of {text.Length} chars)";
-    }
 }
 
 public sealed class WriteTool : ITool
@@ -121,10 +138,40 @@ public sealed class EditTool : ITool
 
         if (oldStr.Length == 0) return "old_str is empty; refusing to edit.";
 
-        var text = await File.ReadAllTextAsync(path, ct);
+        // Encoding-preserving read: keep the file's BOM/UTF-16 identity so the write-back
+        // changes only the edited span, and refuse unknown encodings rather than corrupt them.
+        string text;
+        Encoding encoding;
+        try { (text, encoding) = await FileText.ReadAsync(path, ct); }
+        catch (DecoderFallbackException)
+        {
+            return $"'{path}' is not valid UTF-8 and has no BOM (unknown legacy encoding) — refusing to edit to avoid corrupting it.";
+        }
 
         var count = CountOccurrences(text, oldStr);
-        if (count == 0) return "old_str not found in file; nothing changed.";
+        if (count == 0)
+        {
+            // The classic Windows miss: the model emits \n, the file uses \r\n. Retry with
+            // the line endings normalized to the file's before giving up.
+            if (!oldStr.Contains("\r\n", StringComparison.Ordinal) &&
+                oldStr.Contains('\n') &&
+                text.Contains("\r\n", StringComparison.Ordinal))
+            {
+                var oldCrlf = oldStr.Replace("\n", "\r\n", StringComparison.Ordinal);
+                var crlfCount = CountOccurrences(text, oldCrlf);
+                if (crlfCount > 0)
+                {
+                    oldStr = oldCrlf;
+                    newStr = newStr.Replace("\r\n", "\n", StringComparison.Ordinal)
+                                   .Replace("\n", "\r\n", StringComparison.Ordinal);
+                    count = crlfCount;
+                }
+            }
+            if (count == 0)
+                return "old_str not found in file; nothing changed." +
+                       (text.Contains("\r\n", StringComparison.Ordinal) && oldStr.Contains('\n')
+                           ? " (note: this file uses CRLF line endings)" : "");
+        }
         if (count > 1 && !replaceAll)
             return $"old_str occurs {count} times — add surrounding context to make it unique, or pass replace_all=true.";
 
@@ -132,7 +179,7 @@ public sealed class EditTool : ITool
             ? text.Replace(oldStr, newStr)
             : ReplaceFirst(text, oldStr, newStr);
 
-        await File.WriteAllTextAsync(path, updated, ct);
+        await File.WriteAllTextAsync(path, updated, encoding, ct);
         _access?.MarkKnown(path);
         return count > 1 ? $"Edited '{path}' ({count} occurrences)." : $"Edited '{path}'.";
     }
@@ -174,24 +221,33 @@ public sealed class BashTool : ITool
         _usePty = usePty && WindowsPty.IsSupported;
     }
 
+    /// <summary>Default command deadline; override with RATCHET_BASH_TIMEOUT_SECS or per-call timeout_secs.</summary>
+    private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(
+        int.TryParse(Environment.GetEnvironmentVariable("RATCHET_BASH_TIMEOUT_SECS"), out var s) && s > 0 ? s : 120);
+
     public string Name => "bash";
     public string Description =>
-        $"Execute a shell command via {_shell.Name}{(_usePty ? " (pseudo-console)" : "")} and return its combined stdout and stderr.";
+        $"Execute a shell command via {_shell.Name}{(_usePty ? " (pseudo-console)" : "")} and return its combined stdout and stderr. " +
+        $"Commands are killed after timeout_secs (default {(int)DefaultTimeout.TotalSeconds}s); stdin is closed, so interactive prompts fail fast.";
     public string InputSchemaJson => """
-        {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        {"type":"object","properties":{"command":{"type":"string"},"timeout_secs":{"type":"integer","description":"Deadline for this command in seconds (default 120, max 3600)."}},"required":["command"]}
         """;
 
     public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
     {
         var command = Json.GetString(inputJson, "command");
 
+        var timeout = DefaultTimeout;
+        using (var doc = JsonDocument.Parse(inputJson))
+            if (doc.RootElement.TryGetProperty("timeout_secs", out var ts) && ts.TryGetInt32(out var secs))
+                timeout = TimeSpan.FromSeconds(Math.Clamp(secs, 1, 3600));
+
         if (_usePty)
         {
             try
             {
-                // Quote the command as one argument so the shell flag (-c / -Command / /c)
-                // receives it intact — raw concatenation mangled commands with spaces/quotes.
-                var commandLine = $"{_shell.FileName} {_shell.CommandFlag} {QuoteArg(command)}";
+                // One command line, quoted per the shell's own rules (see ShellSpec).
+                var commandLine = _shell.CommandLine(command);
                 var (exit, ptyOutput) = await WindowsPty.RunAsync(commandLine, ct);
                 // The command ran under the pty — trust its result and return it. We do
                 // NOT fall back to the Process path on empty output, because that would
@@ -209,28 +265,10 @@ public sealed class BashTool : ITool
             }
         }
 
-        var psi = new ProcessStartInfo { FileName = _shell.FileName };
-        psi.ArgumentList.Add(_shell.CommandFlag);
-        psi.ArgumentList.Add(command);
+        var psi = new ProcessStartInfo();
+        _shell.Apply(psi, command);   // shell-correct quoting lives on ShellSpec
 
-        var (exitCode, text) = await ProcessRunner.RunAsync(psi, ct);
+        var (exitCode, text) = await ProcessRunner.RunAsync(psi, ct, timeout);
         return $"(exit {exitCode})\n{(text.Length == 0 ? "(no output)" : text)}";
-    }
-
-    /// <summary>Standard Windows argv quoting for a single argument (backslash + quote rules).</summary>
-    private static string QuoteArg(string s)
-    {
-        if (s.Length > 0 && s.IndexOfAny(new[] { ' ', '\t', '"', '\n' }) < 0) return s;
-        var sb = new StringBuilder("\"");
-        var slashes = 0;
-        foreach (var c in s)
-        {
-            if (c == '\\') { slashes++; continue; }
-            if (c == '"') { sb.Append('\\', slashes * 2 + 1).Append('"'); slashes = 0; continue; }
-            if (slashes > 0) { sb.Append('\\', slashes); slashes = 0; }
-            sb.Append(c);
-        }
-        sb.Append('\\', slashes * 2).Append('"');
-        return sb.ToString();
     }
 }

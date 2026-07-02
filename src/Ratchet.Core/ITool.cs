@@ -31,8 +31,16 @@ public sealed class ToolRegistry
 {
     private readonly Dictionary<string, ITool> _tools;
 
-    public ToolRegistry(IEnumerable<ITool> tools) =>
-        _tools = tools.ToDictionary(t => t.Name, StringComparer.Ordinal);
+    public ToolRegistry(IEnumerable<ITool> tools)
+    {
+        _tools = new Dictionary<string, ITool>(StringComparer.Ordinal);
+        foreach (var t in tools)
+            if (!_tools.TryAdd(t.Name, t))
+                throw new ArgumentException(
+                    $"Duplicate tool name '{t.Name}'. Two tools may not share a name — this is usually an " +
+                    "MCP server exposing a tool that collides with a builtin (or with another server). " +
+                    "Rename it on the server, or remove one of the sources.");
+    }
 
     public IReadOnlyCollection<ITool> All => _tools.Values;
 

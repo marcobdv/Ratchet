@@ -41,11 +41,14 @@ public sealed class TestTool : ITool
         var extra = Json.GetStringOrNull(inputJson, "args");
         var command = string.IsNullOrWhiteSpace(extra) ? _baseCommand : $"{_baseCommand} {extra}";
 
-        var psi = new ProcessStartInfo { FileName = _shell.FileName };
-        psi.ArgumentList.Add(_shell.CommandFlag);
-        psi.ArgumentList.Add(command);
+        var psi = new ProcessStartInfo();
+        _shell.Apply(psi, command);   // shell-correct quoting lives on ShellSpec
 
-        var (exitCode, output) = await ProcessRunner.RunAsync(psi, ct);
+        // Suites are legitimately slow, so the deadline is generous — but unattended
+        // runs still need one (RATCHET_TEST_TIMEOUT_SECS to override).
+        var timeout = TimeSpan.FromSeconds(
+            int.TryParse(Environment.GetEnvironmentVariable("RATCHET_TEST_TIMEOUT_SECS"), out var s) && s > 0 ? s : 600);
+        var (exitCode, output) = await ProcessRunner.RunAsync(psi, ct, timeout);
         return Summarize(command, output, exitCode);
     }
 

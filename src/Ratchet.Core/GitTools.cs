@@ -40,7 +40,9 @@ public static class GitTools
         foreach (var a in args) psi.ArgumentList.Add(a);
         try
         {
-            return await ProcessRunner.RunAsync(psi, ct);
+            // Stdin is closed by ProcessRunner, so a credential prompt fails fast instead
+            // of hanging; the deadline covers a slow network remote all the same.
+            return await ProcessRunner.RunAsync(psi, ct, timeout: TimeSpan.FromSeconds(60));
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex) { return (-1, $"could not run git: {ex.Message} (is git installed and on PATH?)"); }

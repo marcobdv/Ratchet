@@ -8,4 +8,9 @@
     <AssemblyName>Ratchet.Core</AssemblyName>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Non-seam internals (BoundedLineBuffer, FileText) are tested directly. -->
+    <InternalsVisibleTo Include="Ratchet.Tests" />
+  </ItemGroup>
+
 </Project>
