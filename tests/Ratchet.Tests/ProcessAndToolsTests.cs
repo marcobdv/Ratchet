@@ -341,6 +341,67 @@ public sealed class ReadToolTests : IDisposable
         Assert.DoesNotContain("MZ", result); // the raw content never reaches the transcript
     }
 
+    private string WriteLines(string name, int count)
+    {
+        var path = Path.Combine(_dir, name);
+        File.WriteAllLines(path, Enumerable.Range(1, count).Select(i => $"line-{i:D4}"));
+        return path;
+    }
+
+    private static Task<string> Read(string path, int? offset = null, int? limit = null)
+    {
+        var input = new Dictionary<string, object> { ["path"] = path };
+        if (offset is { } o) input["offset"] = o;
+        if (limit is { } l) input["limit"] = l;
+        return new ReadTool().ExecuteAsync(
+            System.Text.Json.JsonSerializer.Serialize(input), CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task OffsetAndLimit_ReturnExactlyThatWindow_WithItsPositionNamed()
+    {
+        var path = WriteLines("paged.txt", 100);
+        var result = await Read(path, offset: 41, limit: 3);
+
+        Assert.Contains("line-0041", result);
+        Assert.Contains("line-0043", result);
+        Assert.DoesNotContain("line-0040", result);
+        Assert.DoesNotContain("line-0044", result);
+        Assert.Contains("lines 41–43 of ", result);
+    }
+
+    [Fact]
+    public async Task WholeSmallFile_ReturnsVerbatim_NoFramingNoise()
+    {
+        var path = Path.Combine(_dir, "small.txt");
+        File.WriteAllText(path, "alpha\nbeta");
+        Assert.Equal("alpha\nbeta", await Read(path));
+    }
+
+    [Fact]
+    public async Task TruncatedBigFile_NamesTheNextOffset_AndItActuallyContinues()
+    {
+        // ~60k lines x ~10 chars comfortably exceeds the 256 KB cap.
+        var path = WriteLines("big.txt", 60_000);
+        var first = await Read(path);
+
+        Assert.Contains("continue with offset=", first);
+        var next = int.Parse(System.Text.RegularExpressions.Regex.Match(first, @"offset=(\d+)").Groups[1].Value);
+        Assert.DoesNotContain($"line-{next:D4}", first);   // the named offset is genuinely unread
+
+        var second = await Read(path, offset: next, limit: 5);
+        Assert.Contains($"line-{next:D4}", second);        // paging picks up exactly where it stopped
+    }
+
+    [Fact]
+    public async Task OffsetPastTheEnd_SaysSo()
+    {
+        var path = WriteLines("short.txt", 10);
+        var result = await Read(path, offset: 50);
+        Assert.Contains("past the end", result);
+        Assert.Contains("10 lines", result);
+    }
+
     [Fact]
     public async Task NonUtf8TextFile_IsShownLossily_ButNotMarkedEditable()
     {

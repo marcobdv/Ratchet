@@ -47,9 +47,11 @@ public sealed class ReadTool : ITool
         int.TryParse(Environment.GetEnvironmentVariable("RATCHET_READ_MAX_BYTES"), out var m) && m > 0 ? m : 256 * 1024;
 
     public string Name => "read";
-    public string Description => "Read the full contents of a file at the given path (large files are truncated).";
+    public string Description =>
+        "Read a file. Large files are truncated with a notice naming the next offset — " +
+        "page through them with offset/limit instead of re-reading from the top.";
     public string InputSchemaJson => """
-        {"type":"object","properties":{"path":{"type":"string","description":"File path to read"}},"required":["path"]}
+        {"type":"object","properties":{"path":{"type":"string","description":"File path to read"},"offset":{"type":"integer","description":"1-based line number to start from (default 1)."},"limit":{"type":"integer","description":"Maximum number of lines to return (default: as many as fit)."}},"required":["path"]}
         """;
 
     public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
@@ -70,6 +72,13 @@ public sealed class ReadTool : ITool
         if (FileText.LooksBinary(bytes))
             return $"'{path}' looks binary ({bytes.Length:N0} bytes) — not showing its content.";
 
+        int? offset = null, limit = null;
+        using (var doc = JsonDocument.Parse(inputJson))
+        {
+            if (doc.RootElement.TryGetProperty("offset", out var o) && o.TryGetInt32(out var ov)) offset = ov;
+            if (doc.RootElement.TryGetProperty("limit", out var l) && l.TryGetInt32(out var lv)) limit = lv;
+        }
+
         string text;
         try { (text, _) = FileText.Decode(bytes); }
         catch (System.Text.DecoderFallbackException)
@@ -77,18 +86,58 @@ public sealed class ReadTool : ITool
             // Unknown legacy encoding: degrade to a lossy read so the model can still
             // look, but don't mark it known — editing it would corrupt those bytes.
             text = System.Text.Encoding.UTF8.GetString(bytes);
-            return $"(note: '{path}' is not valid UTF-8 — shown lossily; editing is disabled)\n" + Truncate(text);
+            return $"(note: '{path}' is not valid UTF-8 — shown lossily; editing is disabled)\n"
+                 + Window(text, offset, limit);
         }
 
         _access?.MarkKnown(path);
         if (text.Length == 0) return "(file is empty)";
-        return Truncate(text);
+        return Window(text, offset, limit);
     }
 
-    private static string Truncate(string text) =>
-        text.Length <= MaxBytes
-            ? text
-            : text[..MaxBytes] + $"\n\n…(truncated: showing {MaxBytes} of {text.Length} chars)";
+    /// <summary>
+    /// The requested line window, bounded by the char cap. Everything beyond the cap
+    /// used to be unreachable by any tool; the notice now names the offset to continue
+    /// from, so paging is one obvious call instead of a dead end.
+    /// </summary>
+    private static string Window(string text, int? offset, int? limit)
+    {
+        // A trailing newline would split into a phantom empty last "line" and skew counts.
+        if (text.EndsWith('\n')) text = text[..^1];
+        if (text.EndsWith('\r')) text = text[..^1];
+
+        var lines = text.Split('\n');   // keeps '\r' on CRLF lines; joining with '\n' restores them
+        var total = lines.Length;
+        var start = Math.Clamp((offset ?? 1) - 1, 0, total);
+        var maxLines = limit is { } l && l > 0 ? l : int.MaxValue;
+
+        var sb = new StringBuilder();
+        var shown = 0;
+        for (var i = start; i < total && shown < maxLines; i++)
+        {
+            if (sb.Length + lines[i].Length + 1 > MaxBytes) break;
+            if (shown > 0) sb.Append('\n');
+            sb.Append(lines[i]);
+            shown++;
+        }
+        var end = start + shown;
+
+        if (shown == 0)
+        {
+            if (start >= total) return $"(offset {offset} is past the end — the file has {total} lines)";
+            // A single pathological line larger than the cap: show its head rather than nothing.
+            return lines[start][..MaxBytes] +
+                   $"\n\n…(line {start + 1} of {total} exceeds the size cap; shown truncated — continue with offset={start + 2})";
+        }
+
+        if (end == total && start == 0 && offset is null && limit is null)
+            return sb.ToString();   // the whole file fit — verbatim, no framing noise
+
+        var notice = end < total
+            ? $"\n\n…(showing lines {start + 1}–{end} of {total}; continue with offset={end + 1})"
+            : $"\n\n(lines {start + 1}–{end} of {total})";
+        return sb + notice;
+    }
 }
 
 public sealed class WriteTool : ITool
