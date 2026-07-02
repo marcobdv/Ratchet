@@ -162,31 +162,44 @@ public sealed class AgentLoopTests
         Assert.True(result.IsError);
     }
 
-    // ---- known bugs, as executable TODOs ------------------------------------
-    // These document behaviour found in the 2026-07 review. Each is written to
-    // assert the CORRECT behaviour and skipped until the fix lands; unskip to drive it.
+    // ---- the stop-reason policy (ADR-0010) -----------------------------------
 
-    [Fact(Skip = "Known bug (review 2026-07, core C1): a non-tool_use stop with pending " +
-                 "tool_use blocks (e.g. max_tokens) leaves orphaned tool_use in the " +
-                 "transcript, which the API rejects on every subsequent call.")]
-    public async Task MaxTokensStopWithPendingToolUse_MustNotLeaveOrphanedToolUse()
+    [Fact]
+    public async Task MaxTokensStopWithPendingToolUse_ClosesThemWithErrorResults()
     {
+        var tool = new RecordingTool("echo");
         var llm = new ScriptedLlmClient()
             .Enqueue(ScriptedLlmClient.ToolCall("t1", "echo", "{}", stopReason: "max_tokens"));
         var convo = new Conversation();
         convo.Add(Message.UserText("go"));
 
-        await MakeAgent(llm, tools: new RecordingTool("echo")).RunTurnAsync(convo, CancellationToken.None);
+        await MakeAgent(llm, tools: tool).RunTurnAsync(convo, CancellationToken.None);
 
-        // Correct behaviour: every tool_use in the transcript has a matching tool_result
-        // in the immediately following user message (or the block was stripped).
-        var orphaned = OrphanedToolUseIds(convo);
-        Assert.Empty(orphaned);
+        // The transcript stays valid: every tool_use answered, the tool never ran,
+        // the turn ended (no second model call), and the result names the interruption.
+        Assert.Empty(OrphanedToolUseIds(convo));
+        Assert.Empty(tool.Inputs);
+        Assert.Single(llm.CallTranscripts);
+        var result = Assert.IsType<ToolResultBlock>(Assert.Single(convo.Messages[2].Content));
+        Assert.True(result.IsError);
+        Assert.Contains("max_tokens", result.Content);
     }
 
-    [Fact(Skip = "Known bug (review 2026-07, core M1): OperationCanceledException from a " +
-                 "tool is swallowed into an error tool-result and the loop makes another " +
-                 "model call with the cancelled token instead of propagating promptly.")]
+    [Fact]
+    public async Task MaxTokensStopWithoutToolUse_JustEndsTheTurn()
+    {
+        var llm = new ScriptedLlmClient()
+            .Enqueue(ScriptedLlmClient.Text("truncated answ", stopReason: "max_tokens"));
+        var convo = new Conversation();
+        convo.Add(Message.UserText("go"));
+
+        await MakeAgent(llm).RunTurnAsync(convo, CancellationToken.None);
+
+        Assert.Equal(2, convo.Messages.Count);
+        Assert.Single(llm.CallTranscripts);
+    }
+
+    [Fact]
     public async Task CancelledTool_PropagatesCancellation_Promptly()
     {
         using var cts = new CancellationTokenSource();

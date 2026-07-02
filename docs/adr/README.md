@@ -30,6 +30,7 @@ think X" survives.
 | [0007](0007-two-layer-routing-not-a-router.md) | Two-layer model routing (predictive + reactive), not a dedicated router | v0.10 | Accepted |
 | [0008](0008-telemetry-on-bcl-in-core.md) | Telemetry on BCL diagnostics in Core; the OTel SDK only in the CLI | v0.11 | Accepted |
 | [0009](0009-readonly-subagents-by-structure.md) | YOLO by default, but delegated sub-agents are scoped read-only by *structure* | v0.9 / v0.11 | Accepted |
+| [0010](0010-stop-reason-policy-at-the-loop-boundary.md) | A stop-reason policy at the loop boundary (orphaned tool_use is closed, truncation refuses loudly) | v0.12 | Accepted |
 
 ## The through-line
 
@@ -37,5 +38,8 @@ Read top to bottom, the ADRs tell one story: **keep the irreducible core small a
 unchanging, and push every elaboration to a seam.** ADR-0001 and ADR-0002 establish
 that discipline; ADRs 0003–0009 are each a worked example of honouring it while
 adding something substantial (persistence, long-context survival, provider choice,
-orchestration, routing, observability, safety). No feature in the project's history
-required editing `Agent.RunTurnAsync`. That is the invariant the ADRs exist to protect.
+orchestration, routing, observability, safety). No *feature* has required editing
+`Agent.RunTurnAsync`; the one deliberate exception is ADR-0010, a *correctness
+invariant* (answer every tool_use) that can only live in the loop that creates it —
+taken knowingly, under ADR-0001's "add the seam, not the branch" escape hatch, and
+recorded here precisely because the rule matters.

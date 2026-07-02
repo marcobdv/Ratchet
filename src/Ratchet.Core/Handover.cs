@@ -63,8 +63,20 @@ public sealed class HandoverGenerator
         var response = await _llm.CompleteAsync(
             HandoverPrompt.System, convo, Array.Empty<ITool>(), onDelta ?? (_ => { }), ct);
 
-        return string.Concat(
+        var doc = string.Concat(
             response.AssistantMessage.Content.OfType<TextBlock>().Select(t => t.Text)).Trim();
+
+        // ADR-0004's promise is "loss is authored, not silent". A handover cut off by
+        // max_tokens — or empty — is precisely a silent loss: on /compact it would
+        // become the ONLY working memory of the fresh session. Refuse loudly instead.
+        if (response.StopReason == "max_tokens")
+            throw new InvalidOperationException(
+                "Handover generation hit max_tokens — the doc is truncated and would silently lose context. " +
+                "Not saved; raise the model's max_tokens or shorten the session before retrying.");
+        if (doc.Length == 0)
+            throw new InvalidOperationException("Handover generation produced an empty document; not saved.");
+
+        return doc;
     }
 }
 

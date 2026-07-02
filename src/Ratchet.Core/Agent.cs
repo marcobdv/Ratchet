@@ -56,7 +56,22 @@ public sealed class Agent
 
             // No tool calls -> the assistant is done with this turn.
             var toolUses = response.AssistantMessage.Content.OfType<ToolUseBlock>().ToList();
-            if (response.StopReason != "tool_use" || toolUses.Count == 0)
+            if (response.StopReason != "tool_use")
+            {
+                // Stop-reason policy (ADR-0010): a non-tool_use stop can still carry
+                // tool_use blocks — max_tokens can cut the response off mid-call. The
+                // API requires every tool_use to be answered by a tool_result in the
+                // next user message; leaving them orphaned poisons the transcript and
+                // 400s every subsequent call. Close them with error results so the
+                // model sees the interruption instead of the session dying.
+                if (toolUses.Count > 0)
+                    conversation.Add(Message.UserToolResults(toolUses.Select(u => (ContentBlock)new ToolResultBlock(
+                        u.Id,
+                        $"[not executed: the response was interrupted (stop_reason={response.StopReason}) before this tool could run]",
+                        true)).ToList()));
+                return;
+            }
+            if (toolUses.Count == 0)
                 return;
 
             // Run every requested tool, collect results, feed them back as one user message.
@@ -107,6 +122,12 @@ public sealed class Agent
             var result = await tool.ExecuteAsync(call.InputJson, ct);
             RatchetTelemetry.RecordTool(call.Name, errorType: null, Stopwatch.GetElapsedTime(started).TotalSeconds);
             return (result, false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // User cancellation is not a tool failure: propagate promptly instead of
+            // feeding an error result back and calling the model with a dead token.
+            throw;
         }
         catch (Exception ex)
         {
