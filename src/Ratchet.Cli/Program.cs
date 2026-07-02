@@ -60,7 +60,7 @@ if (runShowIdx >= 0 && runShowIdx + 1 < args.Length)
 if (args.Contains("--routing-stats"))
 {
     var runs = new FileRunStore(Directory.GetCurrentDirectory()).List();
-    var agg = new Dictionary<(string wt, string phase), (int starts, int fails, int promotes)>();
+    var agg = new Dictionary<(string wt, string phase), (int starts, int fails, int promotes, int escalations)>();
     foreach (var snap in runs)
     {
         var wt = snap.WorkType ?? "-";
@@ -71,16 +71,20 @@ if (args.Contains("--routing-stats"))
             var cur = agg.GetValueOrDefault(key);
             if (ev.Kind == RunEventKind.PhaseStart) cur.starts++;
             else if (ev.Kind == RunEventKind.Promote) cur.promotes++;
+            else if (ev.Kind == RunEventKind.Escalation) cur.escalations++;
             else if (ev.IsGateFailure) cur.fails++;   // structured outcome, not a reason-text substring
             agg[key] = cur;
         }
     }
     if (agg.Count == 0) { Console.WriteLine("(no routing telemetry yet — run some workflows)"); return 0; }
-    Console.WriteLine("routing telemetry by (work_type, phase) — high escalation_rate ⇒ retune that phase's cheap default upward:");
+    // promotion_rate = the reactive layer climbing the driver ladder for that (work_type, phase);
+    // a high rate means the cheap predictive default is wrong and should be retuned upward.
+    // escalations are the distinct "bigger than sized" re-frames — reported separately, not conflated.
+    Console.WriteLine("routing telemetry by (work_type, phase) — high promotion_rate ⇒ retune that phase's cheap default upward:");
     foreach (var ((wt, phase), v) in agg.OrderByDescending(a => a.Value.starts > 0 ? (double)a.Value.promotes / a.Value.starts : 0))
     {
         var rate = v.starts > 0 ? (double)v.promotes / v.starts : 0;
-        Console.WriteLine($"  {wt,-12} {phase,-10}  starts={v.starts,-4} gate_fails={v.fails,-4} promotes={v.promotes,-4} escalation_rate={rate:P0}");
+        Console.WriteLine($"  {wt,-12} {phase,-10}  starts={v.starts,-4} gate_fails={v.fails,-4} promotes={v.promotes,-4} escalations={v.escalations,-4} promotion_rate={rate:P0}");
     }
     return 0;
 }
@@ -238,7 +242,9 @@ if ((wfIdx >= 0 && wfIdx + 1 < args.Length) || (wfResumeIdx >= 0 && wfResumeIdx 
         wfTask = string.Join(' ', args.Skip(wfIdx + 2));
         if (string.IsNullOrWhiteSpace(wfTask)) { Console.Write("workflow task> "); wfTask = Console.ReadLine() ?? ""; }
         if (string.IsNullOrWhiteSpace(wfTask)) { Console.Error.WriteLine("no task given"); return 1; }
-        runId = "wf-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        // UTC + ms + random suffix (via SessionId.NewId), not second-resolution local time —
+        // two runs started in the same second must not overwrite each other's snapshot.
+        runId = "wf-" + SessionId.NewId();
     }
 
     WorkflowConfig wf;

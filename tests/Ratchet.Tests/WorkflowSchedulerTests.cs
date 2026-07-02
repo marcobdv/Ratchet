@@ -89,6 +89,30 @@ public sealed class WorkflowSchedulerTests : IDisposable
     }
 
     [Fact]
+    public void GateFailure_IsStructured_NotSubstringParsed()
+    {
+        var run = new WorkflowRun("wf-x", "t");
+        // A PASS whose reason text happens to contain the old failure marker must not
+        // be miscounted as a failure — the whole point of the structured flag.
+        run.Gate("review", "judge", "pass", "the plan said 'route -> fail on error' which is fine");
+        run.Gate("verify", "command", "fail", "dotnet build exit 1");
+
+        var events = run.Events.Where(e => e.Kind == RunEventKind.Gate).ToList();
+        Assert.False(events[0].IsGateFailure);   // pass, despite '-> fail' in the reason
+        Assert.True(events[0].GatePassed);
+        Assert.True(events[1].IsGateFailure);
+        Assert.False(events[1].GatePassed);
+    }
+
+    [Fact]
+    public void OldSnapshotWithoutStructuredFlag_FallsBackToSubstring()
+    {
+        // A pre-v0.12 gate event (GatePassed == null) still classifies via the reason text.
+        Assert.True(new RunEvent(RunEventKind.Gate, "verify", "command -> fail: exit 1").IsGateFailure);
+        Assert.False(new RunEvent(RunEventKind.Gate, "verify", "command -> pass").IsGateFailure);
+    }
+
+    [Fact]
     public async Task ResumedRunWithARenamedPhase_FailsGracefully_NotWithAnNre()
     {
         var config = WorkflowLoader.Parse("""

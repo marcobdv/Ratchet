@@ -264,7 +264,7 @@ Every run is recorded to `.ratchet/runs/<id>.json` — the classification + reas
 the event trace, and **per-tier token cost** (so "are the cheap drivers actually
 carrying the load?" is answerable). Inspect with `ratchet --runs` / `ratchet --run
 <id>`. An interrupted run checkpoints after each phase and continues with `ratchet
---workflow-resume <id>`. `ratchet --routing-stats` aggregates the escalation rate per
+--workflow-resume <id>`. `ratchet --routing-stats` aggregates the *promotion* rate per
 `(work_type, phase)` so a wrong cheap default shows up and is retuned with a one-line
 config diff. The full design and rationale is
 [`docs/workflow-orchestration.md`](docs/workflow-orchestration.md); model routing is
@@ -518,8 +518,9 @@ in its prompt.
 >   `work_type` opts out with `promote: false`. Escalation does **not** promote; it stays the
 >   distinct fresh-context re-frame.
 > - **Feedback loop.** Promotions are recorded per `(work_type, phase)`; `ratchet
->   --routing-stats` aggregates the escalation rate across runs, so a cheap default that's wrong
->   shows up as a high rate and is retuned with a one-line config diff — adaptation without a
+>   --routing-stats` aggregates the promotion rate across runs (escalations are counted
+>   separately, not conflated), so a cheap default that's wrong shows up as a high rate and is
+>   retuned with a one-line config diff — adaptation without a
 >   learned black box. Why two layers beat a router *on its own turf*: coding has ground truth a
 >   `dotnet test` away, so reacting to "did it pass" beats predicting "will it be hard", and the
 >   decision stays diffable. Rides the existing scheduler; the loop's control flow is unchanged.

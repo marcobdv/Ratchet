@@ -5,8 +5,15 @@ public enum RunStatus { Running, Completed, Failed }
 /// <summary>One recorded event in a run's trace (classification, skip, gate, consult, conflict…).</summary>
 public sealed record RunEvent(string Kind, string Phase, string Detail)
 {
-    /// <summary>True for a gate event whose outcome was a failure (parsed from the recorded detail).</summary>
-    public bool IsGateFailure => Kind == RunEventKind.Gate && Detail.Contains(" -> fail", StringComparison.Ordinal);
+    /// <summary>For a gate event: the structured pass/fail outcome (null for non-gate events,
+    /// or gate events from a pre-v0.12 snapshot that only recorded the reason text).</summary>
+    public bool? GatePassed { get; init; }
+
+    /// <summary>True for a gate event whose outcome was a failure. Prefers the structured
+    /// <see cref="GatePassed"/> flag; falls back to the reason-text substring only for old
+    /// snapshots that predate the flag (where a reason containing " -> fail" could misfire).</summary>
+    public bool IsGateFailure => Kind == RunEventKind.Gate &&
+        (GatePassed is { } passed ? !passed : Detail.Contains(" -> fail", StringComparison.Ordinal));
 }
 
 /// <summary>
@@ -105,7 +112,11 @@ public sealed class WorkflowRun : IWorkflowObserver
 
     public void Gate(string phaseId, string kind, string outcome, string reason)
     {
-        Add(RunEventKind.Gate, phaseId, $"{kind} -> {outcome}{(reason.Length > 0 ? ": " + Trunc(reason) : "")}");
+        Events.Add(new RunEvent(RunEventKind.Gate, phaseId,
+            $"{kind} -> {outcome}{(reason.Length > 0 ? ": " + Trunc(reason) : "")}")
+        {
+            GatePassed = outcome == "pass",   // structured, not a reason-text substring
+        });
         _echo?.Gate(phaseId, kind, outcome, reason);
     }
 
