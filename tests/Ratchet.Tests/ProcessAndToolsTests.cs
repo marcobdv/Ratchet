@@ -136,6 +136,65 @@ public sealed class ToolRegistryTests
     }
 }
 
+public sealed class ScopedReadToolTests : IDisposable
+{
+    private readonly string _base = Path.Combine(Path.GetTempPath(), "ratchet-scoperead-" + Guid.NewGuid().ToString("N"));
+    private readonly string _root;
+
+    public ScopedReadToolTests()
+    {
+        _root = Path.Combine(_base, "proj");
+        Directory.CreateDirectory(_root);
+        Directory.CreateDirectory(Path.Combine(_base, "proj2"));
+        File.WriteAllText(Path.Combine(_root, "inside.txt"), "inside contents");
+        File.WriteAllText(Path.Combine(_base, "proj2", "secret.txt"), "SECRET");
+        File.WriteAllText(Path.Combine(_base, "outside.txt"), "OUTSIDE");
+    }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_base, recursive: true); } catch { }
+    }
+
+    private Task<string> Read(string path) =>
+        new ReadTool(access: null, root: _root).ExecuteAsync(
+            System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, string> { ["path"] = path }),
+            CancellationToken.None);
+
+    [Fact]
+    public async Task InsideTheWorkspace_RelativeAndAbsolute_AreAllowed()
+    {
+        Assert.Equal("inside contents", await Read("inside.txt"));
+        Assert.Equal("inside contents", await Read(Path.Combine(_root, "inside.txt")));
+    }
+
+    [Fact]
+    public async Task EscapesAreRefused_AndContentNeverLeaks()
+    {
+        var byDotDot = await Read(Path.Combine("..", "outside.txt"));
+        var bySiblingPrefix = await Read(Path.Combine("..", "proj2", "secret.txt"));
+        var byAbsolute = await Read(Path.Combine(_base, "proj2", "secret.txt"));
+
+        foreach (var result in new[] { byDotDot, bySiblingPrefix, byAbsolute })
+        {
+            Assert.Contains("outside this agent's workspace", result);
+            Assert.DoesNotContain("SECRET", result);
+            Assert.DoesNotContain("OUTSIDE", result);
+        }
+    }
+
+    [Fact]
+    public async Task UnscopedReadTool_StillReadsAnywhere()
+    {
+        // The top-level agent stays YOLO by design (ADR-0009) — only delegates are scoped.
+        var result = await new ReadTool().ExecuteAsync(
+            System.Text.Json.JsonSerializer.Serialize(
+                new Dictionary<string, string> { ["path"] = Path.Combine(_base, "outside.txt") }),
+            CancellationToken.None);
+        Assert.Equal("OUTSIDE", result);
+    }
+}
+
 public sealed class SearchToolScopeTests : IDisposable
 {
     private readonly string _base = Path.Combine(Path.GetTempPath(), "ratchet-scope-" + Guid.NewGuid().ToString("N"));

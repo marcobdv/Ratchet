@@ -41,13 +41,8 @@ public sealed class SearchTool : ITool
                 max = Math.Clamp(v, 1, 1000);
 
         // Resolve the search root and keep it inside the working dir (read-only + scoped).
-        // Compare with a trailing separator: a bare StartsWith would let "..\proj2" pass
-        // for root "...\proj" (the classic prefix bypass).
         var basePath = string.IsNullOrWhiteSpace(sub) ? _root : Path.GetFullPath(Path.Combine(_root, sub));
-        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-        var rootTrimmed = Path.TrimEndingDirectorySeparator(_root);
-        if (!string.Equals(basePath, rootTrimmed, comparison) &&
-            !basePath.StartsWith(rootTrimmed + Path.DirectorySeparatorChar, comparison))
+        if (!PathScope.IsWithin(_root, basePath))
             return Task.FromResult($"path '{sub}' is outside the working directory.");
         if (!Directory.Exists(basePath) && !File.Exists(basePath))
             return Task.FromResult($"No such path '{sub}'.");

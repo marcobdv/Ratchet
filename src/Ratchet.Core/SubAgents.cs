@@ -72,18 +72,23 @@ public sealed class DelegateTool : ITool
 /// <summary>Builds Ratchet's delegation tools: one investigative sub-agent and three advisors.</summary>
 public static class SubAgents
 {
-    public static IEnumerable<ITool> Build(ILlmClient llm)
+    /// <param name="root">The workspace the explore sub-agent is confined to
+    /// (default: the current directory).</param>
+    public static IEnumerable<ITool> Build(ILlmClient llm, string? root = null)
     {
-        // The explorer investigates and must not mutate anything. Even though the top-level agent
-        // is YOLO by design, a *delegated* agent is scoped to its role: it gets only read-only
-        // tools (read + search), and a ReadOnlyGate enforces that in the loop so the constraint
-        // can't be prompted around — no raw shell, no write/edit.
-        IReadOnlyList<ITool> exploreTools = [new ReadTool(), new SearchTool()];
+        root ??= Directory.GetCurrentDirectory();
+
+        // The explorer investigates and must not mutate anything — and must not read
+        // outside the workspace either. Read-only is enforced by the ReadOnlyGate in the
+        // loop; the workspace scope is enforced by the tools themselves (a rooted read +
+        // a rooted search), so neither constraint can be prompted around. Read-only
+        // WITHOUT scoping would still let a delegate page ~/.ssh into a transcript.
+        IReadOnlyList<ITool> exploreTools = [new ReadTool(access: null, root: root), new SearchTool(root)];
         yield return new DelegateTool(
             "explore",
             "Delegate a focused, READ-ONLY investigation of the codebase to a sub-agent. Input: a clear " +
             "question plus any context (it does not see this conversation). It reads files and searches " +
-            "code, then returns findings. Use it to investigate without filling your own context.",
+            "code within the workspace, then returns findings. Use it to investigate without filling your own context.",
             ExplorerPrompt, llm, exploreTools, gate: new ReadOnlyGate());
 
         yield return new DelegateTool(

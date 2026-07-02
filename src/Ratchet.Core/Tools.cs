@@ -28,10 +28,18 @@ internal static class Json
 public sealed class ReadTool : ITool
 {
     private readonly FileAccessLog? _access;
+    private readonly string? _root;
 
     /// <param name="access">Optional shared access log; reading a file marks it
     /// "known" so the edit tool will allow editing it (the read-before-write guard).</param>
-    public ReadTool(FileAccessLog? access = null) => _access = access;
+    /// <param name="root">Optional workspace scope. When set, reads outside this
+    /// directory are refused — read-only is not the same as scoped, and a delegated
+    /// sub-agent must be both (ADR-0009: the constraint is structural, not prompted).</param>
+    public ReadTool(FileAccessLog? access = null, string? root = null)
+    {
+        _access = access;
+        _root = root is null ? null : Path.GetFullPath(root);
+    }
 
     // Cap the returned text so one big file can't blow the context window (the whole
     // transcript is re-sent every model call). Override with RATCHET_READ_MAX_BYTES.
@@ -47,6 +55,15 @@ public sealed class ReadTool : ITool
     public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
     {
         var path = Json.GetString(inputJson, "path");
+
+        if (_root is not null)
+        {
+            var full = Path.GetFullPath(path, _root);   // relative paths resolve against the scope
+            if (!PathScope.IsWithin(_root, full))
+                return $"'{path}' is outside this agent's workspace ('{_root}') — refused.";
+            path = full;
+        }
+
         if (!File.Exists(path)) return $"No file at '{path}'.";
 
         var bytes = await File.ReadAllBytesAsync(path, ct);
