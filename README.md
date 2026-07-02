@@ -369,6 +369,7 @@ landed in:
 | v0.8 | [ADR-0006](docs/adr/0006-deterministic-orchestrator.md) deterministic orchestrator; LLM judgment only at classifier + judge gates |
 | v0.10 | [ADR-0007](docs/adr/0007-two-layer-routing-not-a-router.md) two-layer model routing (predictive + reactive), not a router |
 | v0.11 | [ADR-0008](docs/adr/0008-telemetry-on-bcl-in-core.md) telemetry on BCL diagnostics in Core; the SDK only in the CLI · [ADR-0009](docs/adr/0009-readonly-subagents-by-structure.md) YOLO by default, but sub-agents scoped read-only by structure |
+| v0.12 | [ADR-0010](docs/adr/0010-stop-reason-policy-at-the-loop-boundary.md) a stop-reason policy at the loop boundary — the one deliberate loop edit, to keep the transcript valid when a response is cut off mid-tool-call |
 
 ## 🚫 What it deliberately does NOT do
 
@@ -538,6 +539,43 @@ in its prompt.
 > it belongs to. The turn/tool/gate spans are in-loop additions to `Agent.cs` — instrumentation,
 > not control flow, but "untouched" would overstate it. This version also bundles the full-solution
 > review fixes and the read-only sub-agent scoping (`ReadOnlyGate` + a read-only `search`).
+>
+> **v0.12 — trust: tests, hardening, and the thinking round-trip.** A full external review
+> drove this release; the theme is *survives failure*, not new surface. A `tests/Ratchet.Tests`
+> project (xUnit) and a GitHub Actions CI gate land first — the earlier "verified by a
+> deterministic harness" doc claims are now backed by ~136 tests (a scripted `ILlmClient`, canned
+> SSE streams, table-driven loader/store cases), and CI already caught a CRLF-only test bug. Then
+> the substrate is hardened along every seam the loop already calls:
+> - **Wire layer.** A typed `LlmException` (status · provider error type · retryable) with
+>   exponential backoff honouring `Retry-After`; all three streaming clients now *throw* on a
+>   stream that ends before `message_stop`/`[DONE]` instead of reporting a truncated answer as
+>   success; `HttpClient.Timeout` is infinite for streaming with a per-read idle guard;
+>   `ChatClientLlm` propagates the real finish reason so `max_tokens` truncation is visible.
+> - **The loop's one invariant** ([ADR-0010](docs/adr/0010-stop-reason-policy-at-the-loop-boundary.md)):
+>   a non-`tool_use` stop that still carries `tool_use` blocks (e.g. `max_tokens` mid-call) gets
+>   them closed with error results, so the transcript stays API-valid instead of 400ing every
+>   later call — the one deliberate loop edit, taken under ADR-0001's escape hatch. Cancellation
+>   propagates promptly; a truncated/empty handover refuses loudly (ADR-0004).
+> - **Durability + persistence.** A new `IAgentObserver.OnMessageAppended` seam lets a host
+>   checkpoint turn progress, so a mid-turn failure no longer drops completed tool work; session
+>   and handover saves are atomic (temp + rename); `SessionTree.FromNodes` validates structure
+>   (dangling parents, cycles) and a corrupt/unrecognised file refuses rather than loading as an
+>   empty tree the next save overwrites. The SQLite store's FTS index can no longer desync from
+>   `nodes` (conditional inserts, per-row backfill), serializes on one lock, escapes LIKE
+>   wildcards, and carries a `user_version` schema gate.
+> - **Process substrate.** Bounded head+tail output (no context blowups), default timeouts with
+>   process-tree kill (Process *and* the ConPTY path via a Job Object), stdin closed so prompts
+>   fail fast, correct cmd.exe quoting, BOM/UTF-16-preserving edits with a CRLF fallback, binary
+>   detection, and `read` paging (offset/limit).
+> - **Workflow circuits.** A red gate's reason now reaches the retry prompt (and survives resume),
+>   the review judge sees the real `git diff` not just the driver's self-summary, the `verify`
+>   floor runs `dotnet test`, and gate outcomes are structured (no substring parsing).
+> - **New capability, on the seams.** Thinking-block round-trip — extended-thinking models parse,
+>   persist, and replay their `thinking`/`redacted_thinking` blocks verbatim (signature intact),
+>   so Ratchet can drive a thinking-enabled model; and the `explore` sub-agent's reads are now
+>   *scoped* to the workspace, making [ADR-0009](docs/adr/0009-readonly-subagents-by-structure.md)'s
+>   "scoped by structure" true in mechanism, not just by gate. The loop's control flow is unchanged;
+>   everything else grew on a seam, exactly as the design always promised.
 
 ## 🛠️ Technologies
 
