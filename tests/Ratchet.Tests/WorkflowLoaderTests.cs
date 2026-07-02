@@ -239,8 +239,11 @@ public sealed class WorkflowLoaderTests
     [Fact]
     public void TypoedDefaultsAdvisorModel_IsRejectedAtLoadTime()
     {
-        AssertRejects(ValidYaml.Replace("defaults:\n  driver: cheap",
-            "defaults:\n  driver: cheap\n  advisor: { model: warp9 }"),
+        // Single-line Replace pattern: a multi-line pattern with "\n" silently no-ops
+        // when the source file is checked out with CRLF (raw string literals inherit
+        // the file's line endings).
+        AssertRejects(ValidYaml.Replace("  driver: cheap",
+            "  driver: cheap\n  advisor: { model: warp9 }"),
             "defaults.advisor.model 'warp9'");
     }
 
