@@ -18,6 +18,12 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
 {
     private readonly SqliteConnection _conn;
 
+    // Microsoft.Data.Sqlite connections are NOT thread-safe; one shared connection
+    // serves every operation, so all public entry points serialize on this. Cross-
+    // process safety comes from WAL + SQLite's own busy handling; this lock is for
+    // intra-process races (an autosave against a concurrent `recall` search).
+    private readonly object _lock = new();
+
     public SqliteSessionStore(string baseDir)
     {
         var dir = Path.Combine(baseDir, ".ratchet");
@@ -26,31 +32,46 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         _conn = new SqliteConnection($"Data Source={Path.Combine(dir, "ratchet.db")}");
         _conn.Open();
         Exec("PRAGMA journal_mode=WAL;");
-        Exec("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id          TEXT PRIMARY KEY,
-                head_id     TEXT,
-                updated_utc TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS nodes (
-                session_id   TEXT NOT NULL,
-                id           TEXT NOT NULL,
-                parent_id    TEXT,
-                message_json TEXT NOT NULL,
-                role         TEXT NOT NULL,
-                text_excerpt TEXT,
-                PRIMARY KEY (session_id, id)
-            );
-            CREATE INDEX IF NOT EXISTS ix_nodes_parent ON nodes(session_id, parent_id);
-            """);
 
-        // Full-text index over the flattened transcript text, so `recall` can search
-        // in the database (the ITextSearchableStore seam) instead of loading the whole
-        // tree into memory. Standalone FTS5 table keyed by session + node.
-        Exec("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
-                USING fts5(session_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, body);
-            """);
+        // Versioned schema: user_version gates migrations so a future column addition
+        // is a numbered block here, not ad-hoc ALTER TABLE probing. Version 1 = the
+        // v0.4 tables + the v0.7 FTS index (both idempotent, so stamping an existing
+        // pre-versioning database as 1 is safe).
+        long version;
+        using (var v = _conn.CreateCommand())
+        {
+            v.CommandText = "PRAGMA user_version;";
+            version = Convert.ToInt64(v.ExecuteScalar());
+        }
+        if (version < 1)
+        {
+            Exec("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id          TEXT PRIMARY KEY,
+                    head_id     TEXT,
+                    updated_utc TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS nodes (
+                    session_id   TEXT NOT NULL,
+                    id           TEXT NOT NULL,
+                    parent_id    TEXT,
+                    message_json TEXT NOT NULL,
+                    role         TEXT NOT NULL,
+                    text_excerpt TEXT,
+                    PRIMARY KEY (session_id, id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_nodes_parent ON nodes(session_id, parent_id);
+                """);
+
+            // Full-text index over the flattened transcript text, so `recall` can search
+            // in the database (the ITextSearchableStore seam) instead of loading the whole
+            // tree into memory. Standalone FTS5 table keyed by session + node.
+            Exec("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
+                    USING fts5(session_id UNINDEXED, node_id UNINDEXED, role UNINDEXED, body);
+                """);
+            Exec("PRAGMA user_version = 1;");
+        }
     }
 
     public string Save(string? id, SessionTree tree)
@@ -59,19 +80,23 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         // collide and silently merge two conversations under one PRIMARY KEY via ON CONFLICT.
         id ??= SessionId.NewId();
 
+        lock (_lock)
+        {
+        using var tx = _conn.BeginTransaction();
+
         // Which nodes are already persisted? They're immutable, so we insert only
         // the ones we haven't seen — reading a few ids is far cheaper than
-        // re-serialising every message every turn.
+        // re-serialising every message every turn. Read INSIDE the transaction so a
+        // concurrent save can't slip between the check and the inserts.
         var existing = new HashSet<string>(StringComparer.Ordinal);
         using (var sel = _conn.CreateCommand())
         {
+            sel.Transaction = tx;
             sel.CommandText = "SELECT id FROM nodes WHERE session_id = $s";
             sel.Parameters.AddWithValue("$s", id);
             using var r = sel.ExecuteReader();
             while (r.Read()) existing.Add(r.GetString(0));
         }
-
-        using var tx = _conn.BeginTransaction();
 
         using (var up = _conn.CreateCommand())
         {
@@ -118,7 +143,11 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
                 pM.Value = MessageJson.Serialize(node.Message);
                 pRole.Value = role;
                 pEx.Value = (object?)Excerpt(node.Message) ?? DBNull.Value;
-                ins.ExecuteNonQuery();
+
+                // FTS only when the node row actually landed: the nodes insert is
+                // OR IGNORE, and an unconditional FTS insert next to it desyncs the
+                // index — duplicate rows that surface as duplicate search hits forever.
+                if (ins.ExecuteNonQuery() != 1) continue;
 
                 fS.Value = id;
                 fId.Value = node.Id;
@@ -130,6 +159,7 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
 
         tx.Commit();
         return id;
+        }
     }
 
     /// <summary>
@@ -139,7 +169,9 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
     /// </summary>
     public IReadOnlyList<TextHit> SearchText(string sessionId, string query, int max)
     {
-        BackfillFtsIfEmpty(sessionId);
+        lock (_lock)
+        {
+        BackfillMissingFts(sessionId);
         max = Math.Clamp(max, 1, 50);
 
         // A query of pure FTS separators (e.g. "-", "()") tokenizes to an empty MATCH that
@@ -171,20 +203,23 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         {
             return LikeScan(sessionId, query, max);   // FTS rejected the query for some reason
         }
+        }
     }
 
-    /// <summary>Plain substring scan — the fallback when FTS can't or won't match.</summary>
+    /// <summary>Plain substring scan — the fallback when FTS can't or won't match.
+    /// The query's own %/_ are escaped so they match literally, not as wildcards.</summary>
     private List<TextHit> LikeScan(string sessionId, string query, int max)
     {
+        var escaped = query.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
         var hits = new List<TextHit>(max);
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT node_id, role, body FROM nodes_fts
-            WHERE session_id = $s AND body LIKE $like
+            WHERE session_id = $s AND body LIKE $like ESCAPE '\'
             LIMIT $max;
             """;
         cmd.Parameters.AddWithValue("$s", sessionId);
-        cmd.Parameters.AddWithValue("$like", "%" + query + "%");
+        cmd.Parameters.AddWithValue("$like", "%" + escaped + "%");
         cmd.Parameters.AddWithValue("$max", max);
         using var r = cmd.ExecuteReader();
         while (r.Read())
@@ -192,21 +227,23 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         return hits;
     }
 
-    /// <summary>Index older sessions (rows written before the FTS table existed) on first search.</summary>
-    private void BackfillFtsIfEmpty(string sessionId)
+    /// <summary>
+    /// Index any node rows the FTS table is missing. Not just "when FTS is empty":
+    /// a pre-FTS session that got ONE new save had a non-empty index with every
+    /// older node permanently unsearchable — the check must be per-row, and it runs
+    /// inside the transaction so a concurrent search can't double-backfill.
+    /// </summary>
+    private void BackfillMissingFts(string sessionId)
     {
-        using (var chk = _conn.CreateCommand())
-        {
-            chk.CommandText = "SELECT EXISTS(SELECT 1 FROM nodes_fts WHERE session_id = $s);";
-            chk.Parameters.AddWithValue("$s", sessionId);
-            if (Convert.ToInt64(chk.ExecuteScalar()) != 0) return;
-        }
-
         using var tx = _conn.BeginTransaction();
         using (var sel = _conn.CreateCommand())
         {
             sel.Transaction = tx;
-            sel.CommandText = "SELECT id, message_json FROM nodes WHERE session_id = $s;";
+            sel.CommandText = """
+                SELECT id, message_json FROM nodes
+                WHERE session_id = $s
+                  AND id NOT IN (SELECT node_id FROM nodes_fts WHERE session_id = $s);
+                """;
             sel.Parameters.AddWithValue("$s", sessionId);
 
             using var ins = _conn.CreateCommand();
@@ -264,6 +301,8 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
 
     public SessionTree? Load(string id)
     {
+        lock (_lock)
+        {
         string? head;
         using (var h = _conn.CreateCommand())
         {
@@ -290,10 +329,13 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         }
 
         return SessionTree.FromNodes(nodes, head);
+        }
     }
 
     public IReadOnlyList<SessionInfo> List()
     {
+        lock (_lock)
+        {
         var infos = new List<SessionInfo>();
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
@@ -318,6 +360,7 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
                 r.IsDBNull(3) ? "(no prompt)" : r.GetString(3)));
         }
         return infos;
+        }
     }
 
     /// <summary>
@@ -328,6 +371,8 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
     /// </summary>
     public Conversation MaterializeActivePath(string id)
     {
+        lock (_lock)
+        {
         string? head;
         using (var h = _conn.CreateCommand())
         {
@@ -357,6 +402,7 @@ public sealed class SqliteSessionStore : ISessionStore, ITextSearchableStore, ID
         while (rr.Read())
             conversation.Add(MessageJson.Deserialize(rr.GetString(0)));
         return conversation;
+        }
     }
 
     private static string? Excerpt(Message m)
