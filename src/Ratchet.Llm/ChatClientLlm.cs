@@ -52,6 +52,7 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
         {
             var text = new StringBuilder();
             var toolCalls = new List<FunctionCallContent>();
+            var reasoning = new List<TextReasoningContent>();
             long inputTokens = 0, outputTokens = 0;
             ChatFinishReason? finishReason = null;
 
@@ -62,6 +63,10 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
                 {
                     switch (content)
                     {
+                        // Reasoning before TextContent: keep thinking out of the visible text.
+                        case TextReasoningContent trc:
+                            reasoning.Add(trc);
+                            break;
                         case TextContent t when t.Text.Length > 0:
                             text.Append(t.Text);
                             onTextDelta(t.Text);
@@ -78,6 +83,12 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
             }
 
             var blocks = new List<ContentBlock>();
+            // Thinking first: the API requires an assistant turn to replay its thinking
+            // blocks ahead of text/tool_use. Empty Text = redacted (opaque) thinking.
+            foreach (var trc in reasoning)
+                blocks.Add(trc.Text.Length > 0
+                    ? new ThinkingBlock(trc.Text, trc.ProtectedData ?? "")
+                    : new RedactedThinkingBlock(trc.ProtectedData ?? ""));
             if (text.Length > 0)
                 blocks.Add(new TextBlock(text.ToString()));
             foreach (var call in toolCalls)
@@ -140,6 +151,12 @@ public sealed class ChatClientLlm : ILlmClient, IDisposable
                 {
                     case TextBlock t:
                         blocks.Add(new TextContent(t.Text));
+                        break;
+                    case ThinkingBlock th:
+                        blocks.Add(new TextReasoningContent(th.Thinking) { ProtectedData = th.Signature });
+                        break;
+                    case RedactedThinkingBlock rt:
+                        blocks.Add(new TextReasoningContent("") { ProtectedData = rt.Data });
                         break;
                     case ToolUseBlock u:
                         var args = u.InputJson.Length == 0

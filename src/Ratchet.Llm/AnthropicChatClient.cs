@@ -24,6 +24,11 @@ public sealed class AnthropicChatClient : IChatClient
     private readonly string _model;
     private readonly int _maxTokens;
 
+    /// <summary>Opt-in extended thinking for models that need the explicit param
+    /// (always-on models emit thinking blocks without it). Value = budget_tokens.</summary>
+    private static readonly int ThinkingBudget =
+        int.TryParse(Environment.GetEnvironmentVariable("RATCHET_THINKING_BUDGET"), out var b) && b >= 1024 ? b : 0;
+
     public AnthropicChatClient(string apiKey, string model, int maxTokens = 4096)
     {
         _model = model;
@@ -54,6 +59,7 @@ public sealed class AnthropicChatClient : IChatClient
         using var reader = new StreamReader(stream);
 
         var toolBuilders = new SortedDictionary<int, ToolBuilder>();
+        var thinkingBuilders = new SortedDictionary<int, ThinkingBuilder>();
         long inputTokens = 0, outputTokens = 0;
         var stopReason = "end_turn";
         var completed = false; // saw message_stop — anything less is a truncated stream
@@ -85,13 +91,26 @@ public sealed class AnthropicChatClient : IChatClient
                 {
                     var idx = root.GetProperty("index").GetInt32();
                     var cb = root.GetProperty("content_block");
-                    if (cb.GetProperty("type").GetString() == "tool_use")
+                    switch (cb.GetProperty("type").GetString())
                     {
-                        toolBuilders[idx] = new ToolBuilder
-                        {
-                            Id = cb.GetProperty("id").GetString()!,
-                            Name = cb.GetProperty("name").GetString()!,
-                        };
+                        case "tool_use":
+                            toolBuilders[idx] = new ToolBuilder
+                            {
+                                Id = cb.GetProperty("id").GetString()!,
+                                Name = cb.GetProperty("name").GetString()!,
+                            };
+                            break;
+                        case "thinking":
+                            thinkingBuilders[idx] = new ThinkingBuilder();
+                            break;
+                        case "redacted_thinking":
+                            // Arrives whole (encrypted) — opaque round-trip only.
+                            thinkingBuilders[idx] = new ThinkingBuilder
+                            {
+                                Redacted = true,
+                                Data = cb.TryGetProperty("data", out var d) ? d.GetString() ?? "" : "",
+                            };
+                            break;
                     }
                     break;
                 }
@@ -110,6 +129,14 @@ public sealed class AnthropicChatClient : IChatClient
                         case "input_json_delta":
                             if (toolBuilders.TryGetValue(idx, out var tb))
                                 tb.Json.Append(delta.GetProperty("partial_json").GetString() ?? "");
+                            break;
+                        case "thinking_delta":
+                            if (thinkingBuilders.TryGetValue(idx, out var th))
+                                th.Text.Append(delta.GetProperty("thinking").GetString() ?? "");
+                            break;
+                        case "signature_delta":
+                            if (thinkingBuilders.TryGetValue(idx, out var th2))
+                                th2.Signature.Append(delta.GetProperty("signature").GetString() ?? "");
                             break;
                     }
                     break;
@@ -144,8 +171,16 @@ public sealed class AnthropicChatClient : IChatClient
             throw new LlmStreamInterruptedException(
                 "stream ended before message_stop — the response is incomplete (dropped connection?).");
 
-        // Final update: any tool calls, the finish reason, and usage.
+        // Final update: reasoning first (replay order), then tool calls, finish reason, usage.
         var finalContents = new List<AIContent>();
+        foreach (var th in thinkingBuilders.Values)
+        {
+            // Convention shared with ChatClientLlm: signed thinking = Text + ProtectedData
+            // (signature); redacted thinking = empty Text + ProtectedData (encrypted blob).
+            finalContents.Add(th.Redacted
+                ? new TextReasoningContent("") { ProtectedData = th.Data }
+                : new TextReasoningContent(th.Text.ToString()) { ProtectedData = th.Signature.ToString() });
+        }
         foreach (var tb in toolBuilders.Values)
         {
             var args = tb.Json.Length == 0
@@ -164,6 +199,14 @@ public sealed class AnthropicChatClient : IChatClient
         {
             FinishReason = MapFinishReason(stopReason, toolBuilders.Count > 0),
         };
+    }
+
+    private sealed class ThinkingBuilder
+    {
+        public bool Redacted;
+        public string Data = "";
+        public readonly StringBuilder Text = new();
+        public readonly StringBuilder Signature = new();
     }
 
     public async Task<ChatResponse> GetResponseAsync(
@@ -205,8 +248,19 @@ public sealed class AnthropicChatClient : IChatClient
         using var w = new Utf8JsonWriter(buffer);
         w.WriteStartObject();
         w.WriteString("model", options?.ModelId ?? _model);
-        w.WriteNumber("max_tokens", (int)(options?.MaxOutputTokens ?? _maxTokens));
+        var maxTokens = (int)(options?.MaxOutputTokens ?? _maxTokens);
+        // Thinking spends from the same max_tokens pot — keep room for the answer.
+        w.WriteNumber("max_tokens", ThinkingBudget > 0 ? Math.Max(maxTokens, ThinkingBudget + 4096) : maxTokens);
         w.WriteBoolean("stream", true);
+
+        if (ThinkingBudget > 0)
+        {
+            w.WritePropertyName("thinking");
+            w.WriteStartObject();
+            w.WriteString("type", "enabled");
+            w.WriteNumber("budget_tokens", ThinkingBudget);
+            w.WriteEndObject();
+        }
 
         // Cache the stable system prompt + tools, and the transcript tail — same breakpoint
         // strategy as AnthropicClient. Only emit the system array when non-empty: Anthropic
@@ -283,6 +337,26 @@ public sealed class AnthropicChatClient : IChatClient
     {
         switch (content)
         {
+            // Thinking replays VERBATIM (signature intact) and never carries
+            // cache_control. Empty Text = redacted thinking (opaque data blob).
+            // NOTE: pattern-match TextReasoningContent BEFORE TextContent in case
+            // of future inheritance changes — order here is deliberate.
+            case TextReasoningContent trc:
+                w.WriteStartObject();
+                if (trc.Text.Length > 0)
+                {
+                    w.WriteString("type", "thinking");
+                    w.WriteString("thinking", trc.Text);
+                    w.WriteString("signature", trc.ProtectedData ?? "");
+                }
+                else
+                {
+                    w.WriteString("type", "redacted_thinking");
+                    w.WriteString("data", trc.ProtectedData ?? "");
+                }
+                w.WriteEndObject();
+                break;
+
             case TextContent t:
                 w.WriteStartObject();
                 w.WriteString("type", "text");

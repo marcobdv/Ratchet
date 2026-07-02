@@ -48,3 +48,17 @@ public sealed record ToolUseBlock(string Id, string Name, string InputJson) : Co
 
 /// <summary>The user-side reply to a ToolUseBlock, matched by ToolUseId.</summary>
 public sealed record ToolResultBlock(string ToolUseId, string Content, bool IsError) : ContentBlock;
+
+/// <summary>
+/// Extended reasoning from a thinking-enabled model. The signature is the API's
+/// integrity stamp: an assistant turn that used tools must be replayed with its
+/// thinking block (signature included) verbatim, or the request is rejected —
+/// so this block round-trips through the transcript untouched.
+/// </summary>
+public sealed record ThinkingBlock(string Thinking, string Signature) : ContentBlock;
+
+/// <summary>
+/// Reasoning the API returned encrypted (safety-filtered). Fully opaque: carried
+/// and replayed verbatim, never displayed.
+/// </summary>
+public sealed record RedactedThinkingBlock(string Data) : ContentBlock;

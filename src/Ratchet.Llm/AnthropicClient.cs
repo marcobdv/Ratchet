@@ -82,7 +82,12 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
 
     // ---- request building -------------------------------------------------
 
-    private string BuildRequestJson(
+    /// <summary>Opt-in extended thinking for models that need the explicit param
+    /// (always-on models emit thinking blocks without it). Value = budget_tokens.</summary>
+    private static readonly int ThinkingBudget =
+        int.TryParse(Environment.GetEnvironmentVariable("RATCHET_THINKING_BUDGET"), out var b) && b >= 1024 ? b : 0;
+
+    internal string BuildRequestJson(
         string systemPrompt,
         Conversation conversation,
         IReadOnlyCollection<ITool> tools)
@@ -92,8 +97,18 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
 
         w.WriteStartObject();
         w.WriteString("model", _model);
-        w.WriteNumber("max_tokens", _maxTokens);
+        // Thinking spends from the same max_tokens pot — keep room for the answer.
+        w.WriteNumber("max_tokens", ThinkingBudget > 0 ? Math.Max(_maxTokens, ThinkingBudget + 4096) : _maxTokens);
         w.WriteBoolean("stream", true);
+
+        if (ThinkingBudget > 0)
+        {
+            w.WritePropertyName("thinking");
+            w.WriteStartObject();
+            w.WriteString("type", "enabled");
+            w.WriteNumber("budget_tokens", ThinkingBudget);
+            w.WriteEndObject();
+        }
 
         // Prompt caching: the system prompt and tool specs are stable across every
         // turn, so cache them; and put a breakpoint at the end of the transcript so
@@ -194,6 +209,23 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                 if (cache) CacheControl.Write(w);
                 w.WriteEndObject();
                 break;
+
+            // Thinking blocks replay VERBATIM — signature included — and never carry
+            // cache_control (the API forbids breakpoints on thinking blocks).
+            case ThinkingBlock th:
+                w.WriteStartObject();
+                w.WriteString("type", "thinking");
+                w.WriteString("thinking", th.Thinking);
+                w.WriteString("signature", th.Signature);
+                w.WriteEndObject();
+                break;
+
+            case RedactedThinkingBlock rt:
+                w.WriteStartObject();
+                w.WriteString("type", "redacted_thinking");
+                w.WriteString("data", rt.Data);
+                w.WriteEndObject();
+                break;
         }
     }
 
@@ -262,6 +294,11 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                         b.Id = cb.GetProperty("id").GetString();
                         b.Name = cb.GetProperty("name").GetString();
                     }
+                    else if (cbType == "redacted_thinking")
+                    {
+                        // Arrives whole (encrypted), not as deltas — capture it here.
+                        b.Data = cb.TryGetProperty("data", out var d) ? d.GetString() : "";
+                    }
                     builders[idx] = b;
                     break;
                 }
@@ -280,6 +317,12 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                             break;
                         case "input_json_delta":
                             b.Json.Append(delta.GetProperty("partial_json").GetString() ?? "");
+                            break;
+                        case "thinking_delta":
+                            b.Text.Append(delta.GetProperty("thinking").GetString() ?? "");
+                            break;
+                        case "signature_delta":
+                            b.Signature.Append(delta.GetProperty("signature").GetString() ?? "");
                             break;
                     }
                     break;
@@ -324,6 +367,12 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
                 blocks.Add(new TextBlock(b.Text.ToString()));
             else if (b.Type == "tool_use")
                 blocks.Add(new ToolUseBlock(b.Id!, b.Name!, b.Json.Length == 0 ? "{}" : b.Json.ToString()));
+            else if (b.Type == "thinking")
+                // Preserved (with signature) — a tool-using assistant turn must be
+                // replayed with its thinking block verbatim or the API rejects it.
+                blocks.Add(new ThinkingBlock(b.Text.ToString(), b.Signature.ToString()));
+            else if (b.Type == "redacted_thinking")
+                blocks.Add(new RedactedThinkingBlock(b.Data ?? ""));
         }
 
         return new LlmResponse(new Message(Role.Assistant, blocks), stopReason, inputTokens, outputTokens);
@@ -338,8 +387,10 @@ public sealed class AnthropicClient : ILlmClient, IDisposable
         public string Type = "";
         public string? Id;
         public string? Name;
-        public readonly StringBuilder Text = new();
+        public string? Data;                          // redacted_thinking payload
+        public readonly StringBuilder Text = new();   // text_delta OR thinking_delta
         public readonly StringBuilder Json = new();
+        public readonly StringBuilder Signature = new();
     }
 
     public void Dispose() => _http.Dispose();

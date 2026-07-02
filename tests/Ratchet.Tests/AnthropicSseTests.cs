@@ -153,23 +153,44 @@ public sealed class AnthropicSseTests
             """));
     }
 
-    [Fact(Skip = "Known gap (review 2026-07, llm M3): thinking blocks are silently dropped " +
-                 "(thinking_delta/signature_delta unhandled, non-text/tool_use builders " +
-                 "discarded) — on a thinking-enabled model the block is lost and cannot be " +
-                 "replayed, which the API rejects for multi-turn tool use.")]
-    public async Task ThinkingBlocks_ArePreserved_NotDropped()
+    [Fact]
+    public async Task ThinkingBlocks_ArePreserved_WithSignature_AndNotStreamedAsText()
     {
+        var deltas = new List<string>();
         var response = await Consume("""
             data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
-            data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning..."}}
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}
+            data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"..."}}
             data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig=="}}
             data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
             data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}
             data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}
             data: {"type":"message_stop"}
 
+            """, deltas.Add);
+
+        Assert.Equal(2, response.AssistantMessage.Content.Count);
+        var thinking = Assert.IsType<ThinkingBlock>(response.AssistantMessage.Content[0]);
+        Assert.Equal("reasoning...", thinking.Thinking);
+        Assert.Equal("sig==", thinking.Signature);   // replay requires the signature verbatim
+        Assert.Equal("answer", ((TextBlock)response.AssistantMessage.Content[1]).Text);
+        Assert.Equal(new[] { "answer" }, deltas);    // thinking never leaks into the text stream
+    }
+
+    [Fact]
+    public async Task RedactedThinking_IsCarriedOpaquely()
+    {
+        var response = await Consume("""
+            data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"ENCRYPTED=="}}
+            data: {"type":"content_block_stop","index":0}
+            data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+            data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+            data: {"type":"message_stop"}
+
             """);
 
-        Assert.Equal(2, response.AssistantMessage.Content.Count); // thinking + text, both kept
+        var redacted = Assert.IsType<RedactedThinkingBlock>(response.AssistantMessage.Content[0]);
+        Assert.Equal("ENCRYPTED==", redacted.Data);
     }
 }

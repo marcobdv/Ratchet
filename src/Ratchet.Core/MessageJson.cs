@@ -59,6 +59,14 @@ public static class MessageJson
                         b.GetProperty("content").GetString() ?? "",
                         b.TryGetProperty("is_error", out var e) && e.GetBoolean()));
                     break;
+                case "thinking":
+                    blocks.Add(new ThinkingBlock(
+                        b.GetProperty("thinking").GetString() ?? "",
+                        b.TryGetProperty("signature", out var sig) ? sig.GetString() ?? "" : ""));
+                    break;
+                case "redacted_thinking":
+                    blocks.Add(new RedactedThinkingBlock(b.GetProperty("data").GetString() ?? ""));
+                    break;
             }
         }
         return new Message(role, blocks);
@@ -92,6 +100,21 @@ public static class MessageJson
                 w.WriteString("tool_use_id", r.ToolUseId);
                 w.WriteString("content", r.Content);
                 w.WriteBoolean("is_error", r.IsError);
+                w.WriteEndObject();
+                break;
+
+            case ThinkingBlock th:
+                w.WriteStartObject();
+                w.WriteString("type", "thinking");
+                w.WriteString("thinking", th.Thinking);
+                w.WriteString("signature", th.Signature);
+                w.WriteEndObject();
+                break;
+
+            case RedactedThinkingBlock rt:
+                w.WriteStartObject();
+                w.WriteString("type", "redacted_thinking");
+                w.WriteString("data", rt.Data);
                 w.WriteEndObject();
                 break;
         }
