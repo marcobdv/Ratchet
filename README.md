@@ -3,13 +3,16 @@
 A deliberately small .NET 9 coding agent — a "pi-plain" port. **Four tools, one
 loop, a hand-rolled Anthropic client.** The point is *understanding the agent loop at
 the wire level*, not competing with Claude Code — and then growing it toward a real
-agent **without ever editing the loop**, by hanging every feature off a seam.
+agent **by hanging every feature off a seam**, so the loop's control flow stays
+fixed. (Honesty note: `Core/Agent.cs` has been touched — a gate check in v0.9, telemetry
+spans in v0.10–v0.11 — but the call/append/dispatch/repeat shape never changed; the
+git history of that one file is the audit trail.)
 
 > v0.1–v0.5 kept it stripped (no MCP, no Roslyn, no sub-agents). From v0.6 it grows
 > along the seams the design always promised: `ILlmClient` now rides
 > `Microsoft.Extensions.AI.IChatClient` (provider-agnostic), and `ITool` gains Roslyn,
 > MCP, sub-agents/advisors, and skills — each in its own project so `Ratchet.Core`
-> stays dependency-free. The loop, the session tree, and handover are untouched.
+> stays dependency-free. The loop's control flow, the session tree, and handover are unchanged.
 
 The decisions behind the design are recorded as [Architecture Decision Records](docs/adr/README.md).
 
@@ -124,6 +127,8 @@ exactly two points: a one-call **classifier** that sizes the task into a `work_t
 (which phase subset runs), and **judge gates** that spend a frontier model on
 merge-readiness an exit code can't express. **Command gates** route on a process exit
 code — the cheapest, strongest judge there is. Floors (`verify`, `review`) always run.
+(Known gap: the shipped `workflows/ratchet-dev.yaml` gates `verify` on `dotnet build`
+only — tests at the floor are designed but not yet wired in.)
 
 ```mermaid
 flowchart TB
@@ -135,7 +140,7 @@ flowchart TB
         R["research"] --> P["plan"] --> I["implement"] --> V["verify"] --> RV["review"] --> L["land"]
     end
 
-    V -. "command gate<br/>dotnet build / test" .-> VG{exit 0?}
+    V -. "command gate<br/>dotnet build" .-> VG{exit 0?}
     VG -- no --> I
     RV -. "judge gate<br/>frontier model" .-> RG{merge-ready?}
     RG -- no --> RV
@@ -495,7 +500,9 @@ in its prompt.
 > - **Resumable runs.** The scheduler checkpoints before each phase; a run interrupted by a
 >   transient failure continues from the last good phase with `--workflow-resume <id>`,
 >   without re-classifying or re-running completed phases — the prerequisite for unattended
->   runs. Each rides an existing seam; the loop is still untouched.
+>   runs. Each rides an existing seam — though this is the version where `Agent.cs`
+>   itself first changed: the gate check in `ExecuteToolAsync` (a new seam, the move
+>   ADR-0001 explicitly allows).
 > - **Provider-agnostic.** `RATCHET_PROVIDER` now selects Anthropic, **OpenRouter** (one key,
 >   hundreds of models), OpenAI, Groq, a local server, or any OpenAI-compatible endpoint via
 >   `RATCHET_BASE_URL` — all through the existing `ILlmClient` seam (`OpenAiChatClient` for the
@@ -517,7 +524,7 @@ in its prompt.
 >   shows up as a high rate and is retuned with a one-line config diff — adaptation without a
 >   learned black box. Why two layers beat a router *on its own turf*: coding has ground truth a
 >   `dotnet test` away, so reacting to "did it pass" beats predicting "will it be hard", and the
->   decision stays diffable. Rides the existing scheduler; the loop is untouched.
+>   decision stays diffable. Rides the existing scheduler; the loop's control flow is unchanged.
 >
 > **v0.11 — OpenTelemetry.** The agent is now observable. Instrumentation lives in Core on the
 > vendor-neutral BCL diagnostics API (`Core/RatchetTelemetry.cs`: one `ActivitySource` + one
@@ -529,7 +536,8 @@ in its prompt.
 > metrics cover token usage, model + tool durations, tool calls, and gate denials. The
 > LLM-client span sits where the model name is known (`ChatClientLlm`, `AnthropicClient`); the
 > turn/tool/gate spans in the loop; the run/phase/gate spans in the scheduler — each on the seam
-> it belongs to, the loop itself still untouched. This version also bundles the full-solution
+> it belongs to. The turn/tool/gate spans are in-loop additions to `Agent.cs` — instrumentation,
+> not control flow, but "untouched" would overstate it. This version also bundles the full-solution
 > review fixes and the read-only sub-agent scoping (`ReadOnlyGate` + a read-only `search`).
 
 ## 🛠️ Technologies

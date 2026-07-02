@@ -225,7 +225,8 @@ promotion shows up in the run's cost breakdown for free.
 4. **Latency exception.** Not applicable: the target is batch/unattended, where the
    failed-cheap-then-retry round trip is free, so the cascade wins outright (as argued).
 
-Verified by a deterministic harness (scripted `ILlmClient`): loader rejects bad ladder /
-override tiers, a per-`work_type` override sets the starting tier, a red gate promotes the
-driver one rung and logs the promotion, the promoted tier survives a resume, and
-`promote: false` loops without climbing.
+Intended verification (a deterministic harness on a scripted `ILlmClient`): loader
+rejects bad ladder / override tiers, a per-`work_type` override sets the starting tier,
+a red gate promotes the driver one rung and logs the promotion, the promoted tier
+survives a resume, and `promote: false` loops without climbing. **Not yet in-tree** —
+planned for the v0.12 test scaffold.

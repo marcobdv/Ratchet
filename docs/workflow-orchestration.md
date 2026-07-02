@@ -448,9 +448,11 @@ requires every floor to run. The loader enforces the *rule* (floors = `verify` +
 merge-readiness gate stays mandatory — skipping it is how a "trivial" change ships a
 regression, which is the exact failure the floors exist to prevent.
 
-The control flow is covered by a deterministic test harness (a scripted `ILlmClient`
-plus a real command gate) exercising classify → phases → judge loop-back →
-command-gate loop-back → escalation, alongside the four loader-validation rules.
+The intended coverage for this control flow is a deterministic test harness (a
+scripted `ILlmClient` plus a real command gate) exercising classify → phases → judge
+loop-back → command-gate loop-back → escalation, alongside the four loader-validation
+rules. **Not yet in-tree** — this lands with the v0.12 test scaffold; until then these
+paths are exercised only by real runs.
 
 **v0.9 additions.** Five things the design called for but v0.8 left open:
 
@@ -469,9 +471,10 @@ command-gate loop-back → escalation, alongside the four loader-validation rule
   an interrupted run continues from the last completed phase via `--workflow-resume`,
   without re-classifying — the unattended-run prerequisite the design kept gesturing at.
 
-These are verified by a second deterministic harness (gate allow/deny in the loop, run
-store roundtrip, cost tally across a full run, interrupt → checkpoint → resume, and a
-real `git_commit` both succeeding and being blocked by a deny gate).
+The intended verification is a second deterministic harness (gate allow/deny in the
+loop, run store roundtrip, cost tally across a full run, interrupt → checkpoint →
+resume, and a real `git_commit` both succeeding and being blocked by a deny gate).
+**Not yet in-tree** — planned for the v0.12 test scaffold.
 
 **Note on `pass_on`.** The illustrative gate YAML above shows `pass_on: exit_zero`, but the
 implementation only ever passes a command gate on exit 0, so `pass_on` was a no-op and has
