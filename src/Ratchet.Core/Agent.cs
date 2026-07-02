@@ -49,7 +49,7 @@ public sealed class Agent
             void OnDelta(string d) { streamedText = true; _observer.OnAssistantTextDelta(d); }
 
             var response = await _llm.CompleteAsync(_systemPrompt, conversation, _tools.All, OnDelta, ct);
-            conversation.Add(response.AssistantMessage);
+            Append(conversation, response.AssistantMessage);
 
             if (streamedText) _observer.OnAssistantTextEnd();
             _observer.OnUsage(response.InputTokens, response.OutputTokens);
@@ -65,7 +65,7 @@ public sealed class Agent
                 // 400s every subsequent call. Close them with error results so the
                 // model sees the interruption instead of the session dying.
                 if (toolUses.Count > 0)
-                    conversation.Add(Message.UserToolResults(toolUses.Select(u => (ContentBlock)new ToolResultBlock(
+                    Append(conversation, Message.UserToolResults(toolUses.Select(u => (ContentBlock)new ToolResultBlock(
                         u.Id,
                         $"[not executed: the response was interrupted (stop_reason={response.StopReason}) before this tool could run]",
                         true)).ToList()));
@@ -84,7 +84,7 @@ public sealed class Agent
                 results.Add(new ToolResultBlock(call.Id, content, isError));
             }
 
-            conversation.Add(Message.UserToolResults(results));
+            Append(conversation, Message.UserToolResults(results));
             // Loop: the model now sees the results and decides what to do next.
         }
         }
@@ -95,6 +95,16 @@ public sealed class Agent
             RatchetTelemetry.Fail(turn, ex);
             throw;
         }
+    }
+
+    // Every message the loop appends flows through here so an observer can persist turn
+    // progress durably (OnMessageAppended). Without this seam, a turn's intermediate
+    // messages lived only in the transient Conversation until the host folded them back
+    // on success — a mid-turn failure dropped completed tool work the model had done.
+    private void Append(Conversation conversation, Message message)
+    {
+        conversation.Add(message);
+        _observer.OnMessageAppended(message);
     }
 
     private async Task<(string content, bool isError)> ExecuteToolAsync(ToolUseBlock call, CancellationToken ct)
@@ -152,4 +162,12 @@ public interface IAgentObserver
     void OnToolCall(string toolName, string inputJson);
     void OnToolResult(string toolName, string content, bool isError);
     void OnUsage(int inputTokens, int outputTokens);
+
+    /// <summary>
+    /// A message was just appended to the conversation (the assistant turn, then its
+    /// tool-results). The durability seam: a host can fold + persist incrementally here
+    /// so a turn that fails on a later model call doesn't lose the tool work already done.
+    /// Default no-op — observers that only render text can ignore it.
+    /// </summary>
+    void OnMessageAppended(Message message) { }
 }

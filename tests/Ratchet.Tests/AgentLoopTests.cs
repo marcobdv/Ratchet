@@ -200,6 +200,48 @@ public sealed class AgentLoopTests
     }
 
     [Fact]
+    public async Task OnMessageAppended_FiresForEveryAppendedMessage_InOrder()
+    {
+        var recorder = new AppendRecorder();
+        var tool = new RecordingTool("echo");
+        var llm = new ScriptedLlmClient()
+            .Enqueue(ScriptedLlmClient.ToolCall("t1", "echo", "{}"))
+            .Enqueue(ScriptedLlmClient.Text("done"));
+        var convo = new Conversation();
+        convo.Add(Message.UserText("go"));
+
+        var agent = new Agent(llm, new ToolRegistry(new[] { tool }), "system", recorder);
+        await agent.RunTurnAsync(convo, CancellationToken.None);
+
+        // assistant(tool_use), user(tool_result), assistant(text) — the durable trail
+        // a host would checkpoint incrementally (the prior user prompt predates the turn).
+        Assert.Equal(3, recorder.Appended.Count);
+        Assert.Equal(Role.Assistant, recorder.Appended[0].Role);
+        Assert.IsType<ToolResultBlock>(recorder.Appended[1].Content[0]);
+        Assert.Equal("done", ((TextBlock)recorder.Appended[2].Content[0]).Text);
+    }
+
+    [Fact]
+    public async Task OnMessageAppended_SeesCompletedWork_EvenWhenALaterModelCallThrows()
+    {
+        var recorder = new AppendRecorder();
+        var tool = new RecordingTool("echo");
+        var llm = new ScriptedLlmClient()
+            .Enqueue(ScriptedLlmClient.ToolCall("t1", "echo", "{}"))          // iteration 1 completes
+            .EnqueueThrow(new InvalidOperationException("network died"));      // iteration 2 model call fails
+        var convo = new Conversation();
+        convo.Add(Message.UserText("go"));
+
+        var agent = new Agent(llm, new ToolRegistry(new[] { tool }), "system", recorder);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => agent.RunTurnAsync(convo, CancellationToken.None));
+
+        // The assistant tool_use and its result were appended before the failure — a host
+        // checkpointing on OnMessageAppended keeps that work instead of dropping the turn.
+        Assert.Equal(2, recorder.Appended.Count);
+        Assert.IsType<ToolResultBlock>(recorder.Appended[1].Content[0]);
+    }
+
+    [Fact]
     public async Task CancelledTool_PropagatesCancellation_Promptly()
     {
         using var cts = new CancellationTokenSource();
@@ -235,5 +277,16 @@ public sealed class AgentLoopTests
     {
         public Task<ToolGateDecision> CheckAsync(string toolName, string inputJson, CancellationToken ct) =>
             throw new InvalidOperationException("gate exploded");
+    }
+
+    private sealed class AppendRecorder : IAgentObserver
+    {
+        public List<Message> Appended { get; } = new();
+        public void OnMessageAppended(Message message) => Appended.Add(message);
+        public void OnAssistantTextDelta(string delta) { }
+        public void OnAssistantTextEnd() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, string content, bool isError) { }
+        public void OnUsage(int inputTokens, int outputTokens) { }
     }
 }

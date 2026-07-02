@@ -311,17 +311,17 @@ Console.WriteLine(recallTool is not null
     : "Type a request, or /help for commands. Ctrl+C to quit.\n");
 
 // ---- the REPL: read a human line, run one agent turn, repeat --------------
-using var cts = new CancellationTokenSource();
-var inTurn = false;
+// App-lifetime token vs. per-turn token: Ctrl+C during a turn cancels JUST that turn
+// (the REPL keeps running); Ctrl+C at the idle prompt falls through to default
+// termination (Console.ReadLine isn't cancellation-aware, so a token can't unblock it).
+CancellationTokenSource? turnCts = null;
 Console.CancelKeyPress += (_, e) =>
 {
-    // During a turn: cancel it and suppress process kill. At the idle prompt: leave e.Cancel
-    // false so Ctrl+C falls through to default termination and actually quits — Console.ReadLine
-    // isn't cancellation-aware, so the token alone can't unblock the prompt.
-    if (inTurn) { e.Cancel = true; cts.Cancel(); }
+    var t = turnCts;
+    if (t is not null && !t.IsCancellationRequested) { e.Cancel = true; t.Cancel(); }
 };
 
-while (!cts.IsCancellationRequested)
+while (true)
 {
     Console.ForegroundColor = ConsoleColor.Green;
     Console.Write("you> ");
@@ -340,37 +340,22 @@ while (!cts.IsCancellationRequested)
     }
 
     // Add the human turn under HEAD, then run the agent over the root..HEAD path.
-    tree.Append(Message.UserText(line));
+    var promptId = tree.Append(Message.UserText(line));
     var conversation = tree.MaterializeConversation();
     var baseCount = conversation.Messages.Count;
 
+    turnCts = new CancellationTokenSource();
+    var completed = false;
     try
     {
-        inTurn = true;
-        await agent.RunTurnAsync(conversation, cts.Token);
-
-        // Fold the new assistant/tool messages back into the tree as a chain,
-        // advancing HEAD — keeping the tree the single source of truth.
-        for (var i = baseCount; i < conversation.Messages.Count; i++)
-            tree.Append(conversation.Messages[i]);
-
-        var wasNew = sessionId is null;
-        sessionId = store.Save(sessionId, tree);
-        if (wasNew)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"  · session {sessionId} (auto-saving)");
-            Console.ResetColor();
-        }
-
-        // Auto-compaction: once the context grows past the configured limit, fold it
-        // into a handover and continue fresh. Pass the just-saved id so it isn't re-saved.
-        if (contextLimit > 0 && observer.LastInputTokens >= contextLimit && tree.Count > 0)
-            await CompactAsync(sessionId);
+        await agent.RunTurnAsync(conversation, turnCts.Token);
+        completed = true;
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
     {
-        break;
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("\n  · turn cancelled");
+        Console.ResetColor();
     }
     catch (Exception ex)
     {
@@ -380,8 +365,50 @@ while (!cts.IsCancellationRequested)
     }
     finally
     {
-        inTurn = false;
+        turnCts.Dispose();
+        turnCts = null;
+
+        var newMessages = conversation.Messages.Count - baseCount;
+        if (newMessages > 0)
+        {
+            // Persist whatever completed — even a failed/cancelled turn ran real tools
+            // whose results must survive (durability). If the turn was cut off after an
+            // assistant tool_use but before its results (Ctrl+C mid-tool), close the
+            // tool_use so the transcript stays API-valid — same invariant as ADR-0010.
+            var last = conversation.Messages[^1];
+            var dangling = last.Role == Role.Assistant
+                ? last.Content.OfType<ToolUseBlock>().ToList()
+                : new List<ToolUseBlock>();
+            if (dangling.Count > 0)
+                conversation.Add(Message.UserToolResults(dangling
+                    .Select(u => (ContentBlock)new ToolResultBlock(u.Id, "[not executed: interrupted]", true))
+                    .ToList()));
+
+            for (var i = baseCount; i < conversation.Messages.Count; i++)
+                tree.Append(conversation.Messages[i]);
+
+            var wasNew = sessionId is null;
+            sessionId = store.Save(sessionId, tree);
+            if (wasNew)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"  · session {sessionId} (auto-saving)");
+                Console.ResetColor();
+            }
+        }
+        else
+        {
+            // The turn produced nothing (first model call failed/cancelled): roll the
+            // unanswered prompt off HEAD so retyping it doesn't leave two user messages
+            // stacked on the live path. The node stays in the tree (nothing destroyed).
+            tree.RewindTurns(1);
+        }
     }
+
+    // Auto-compaction only after a clean turn: fold context past the limit into a
+    // handover and continue fresh. Pass the just-saved id so it isn't re-saved.
+    if (completed && contextLimit > 0 && observer.LastInputTokens >= contextLimit && tree.Count > 0)
+        await CompactAsync(sessionId);
 
     Console.WriteLine();
 }
@@ -450,7 +477,7 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine("  writing handover…\n");
             Console.ForegroundColor = ConsoleColor.DarkCyan;
             string doc;
-            try { doc = await new HandoverGenerator(llm).GenerateAsync(tree.MaterializeConversation(), Console.Write, cts.Token); }
+            try { doc = await new HandoverGenerator(llm).GenerateAsync(tree.MaterializeConversation(), Console.Write, CancellationToken.None); }
             finally { Console.ResetColor(); }
             var file = handovers.Save(new Handover(sessionId!, tree.HeadId, DateTime.UtcNow, doc));
             Console.WriteLine($"\n\n  saved → {file}");
@@ -499,7 +526,7 @@ async Task CompactAsync(string? alreadySavedId = null)
     Console.ForegroundColor = ConsoleColor.DarkCyan;
     Console.WriteLine($"\n  · context ~{observer.LastInputTokens} input tokens — compacting into a handover…\n");
     string doc;
-    try { doc = await new HandoverGenerator(llm).GenerateAsync(tree.MaterializeConversation(), Console.Write, cts.Token); }
+    try { doc = await new HandoverGenerator(llm).GenerateAsync(tree.MaterializeConversation(), Console.Write, CancellationToken.None); }
     finally { Console.ResetColor(); }
     handovers.Save(new Handover(priorId, tree.HeadId, DateTime.UtcNow, doc));
 
