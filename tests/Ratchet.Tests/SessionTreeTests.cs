@@ -82,6 +82,35 @@ public sealed class SessionTreeTests
     }
 
     [Fact]
+    public void Goto_RejectsMidTurnToolUseNodes()
+    {
+        // Landing HEAD on an assistant message with tool_use and then prompting would
+        // leave the tool_use unanswered — the same poisoning RewindTurns guards against.
+        var t = new SessionTree();
+        t.Append(Message.UserText("prompt"));
+        var midTurn = t.Append(new Message(Role.Assistant, new ContentBlock[] { new ToolUseBlock("t1", "read", "{}") }));
+        var results = t.Append(Message.UserToolResults(new ContentBlock[] { new ToolResultBlock("t1", "data", false) }));
+        var tail = t.Append(Assistant("done"));
+
+        Assert.False(t.Goto(midTurn));
+        Assert.Equal(tail, t.HeadId);       // head unmoved on rejection
+        Assert.True(t.Goto(results));       // a tool-result node answers its tool_use — valid
+    }
+
+    [Fact]
+    public void RewindTurns_ZeroOrNegative_IsANoOp_NotAWipe()
+    {
+        var t = new SessionTree();
+        t.Append(Message.UserText("prompt"));
+        var head = t.Append(Assistant("answer"));
+
+        t.RewindTurns(0);
+        Assert.Equal(head, t.HeadId);
+        t.RewindTurns(-3);
+        Assert.Equal(head, t.HeadId);
+    }
+
+    [Fact]
     public void FromNodes_Roundtrip_PreservesPathAndContinuesCounter()
     {
         var t = new SessionTree();
@@ -96,14 +125,25 @@ public sealed class SessionTreeTests
         Assert.Equal("3", next); // counter continued, no id collision
     }
 
-    [Fact(Skip = "Known gap (review 2026-07, core M4): FromNodes performs no structural " +
-                 "validation — a dangling parent crashes Materialize with " +
-                 "KeyNotFoundException mid-walk, and a parent cycle loops forever. " +
-                 "Validation belongs at FromNodes (reject dangling ids and cycles on load).")]
+    [Fact]
     public void FromNodes_RejectsDanglingParents_AtLoadTime()
     {
-        Assert.ThrowsAny<Exception>(() => SessionTree.FromNodes(
+        Assert.Throws<InvalidDataException>(() => SessionTree.FromNodes(
             new[] { new SessionTree.Node("1", "99", Message.UserText("x")) }, head: "1"));
+    }
+
+    [Fact]
+    public void FromNodes_RejectsDanglingHead_AndParentCycles()
+    {
+        Assert.Throws<InvalidDataException>(() => SessionTree.FromNodes(
+            new[] { new SessionTree.Node("1", null, Message.UserText("x")) }, head: "42"));
+
+        Assert.Throws<InvalidDataException>(() => SessionTree.FromNodes(
+            new[]
+            {
+                new SessionTree.Node("1", "2", Message.UserText("a")),
+                new SessionTree.Node("2", "1", Message.UserText("b")),
+            }, head: "1"));
     }
 }
 
@@ -234,17 +274,38 @@ public sealed class FileSessionStoreTests : IDisposable
         Assert.Equal("old answer", ((TextBlock)convo.Messages[1].Content[0]).Text);
     }
 
-    [Fact(Skip = "Known bug (review 2026-07, core C2): Save rewrites the session file in " +
-                 "place (no temp+rename), so a crash mid-write destroys the previous good " +
-                 "copy; and a parseable file matching neither schema loads as an EMPTY tree, " +
-                 "which the next auto-save persists — silent total data loss.")]
-    public void Load_UnrecognizedSchema_MustNotBecomeAnEmptyTreeSilently()
+    [Fact]
+    public void Load_UnrecognizedSchema_RefusesLoudly_NeverAnEmptyTree()
     {
         var store = MakeStore();
         var path = Path.Combine(_dir, ".ratchet", "sessions", "odd.json");
         File.WriteAllText(path, """{ "someFutureShape": true }""");
 
-        // Correct behaviour: refuse loudly (throw / null), never a silently-empty tree.
-        Assert.ThrowsAny<Exception>(() => store.Load("odd"));
+        Assert.Throws<InvalidDataException>(() => store.Load("odd"));
+    }
+
+    [Fact]
+    public void Load_TruncatedJson_RefusesWithAClearError()
+    {
+        var store = MakeStore();
+        var path = Path.Combine(_dir, ".ratchet", "sessions", "cut.json");
+        File.WriteAllText(path, """{ "id": "cut", "nodes": [ { "id": "1", "par"""); // crash mid-write
+
+        var ex = Assert.Throws<InvalidDataException>(() => store.Load("cut"));
+        Assert.Contains("cut.json", ex.Message);
+    }
+
+    [Fact]
+    public void Save_LeavesNoTempFileBehind_AndListIgnoresStrays()
+    {
+        var store = MakeStore();
+        var t = new SessionTree();
+        t.Append(Message.UserText("hello"));
+        var id = store.Save(null, t);
+        store.Save(id, t); // second save exercises the overwrite path
+
+        var dir = Path.Combine(_dir, ".ratchet", "sessions");
+        Assert.Empty(Directory.GetFiles(dir, "*.tmp"));
+        Assert.Single(store.List());
     }
 }

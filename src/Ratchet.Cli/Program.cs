@@ -290,9 +290,18 @@ if (handoverContext is null && args.Any(a => a is "--continue" or "-c"))
     var latest = store.List().FirstOrDefault();
     if (latest is not null)
     {
-        tree = store.Load(latest.Id)!;
-        sessionId = latest.Id;
-        Console.WriteLine($"continued session {sessionId} ({tree.Count} nodes)");
+        try
+        {
+            tree = store.Load(latest.Id)!;
+            sessionId = latest.Id;
+            Console.WriteLine($"continued session {sessionId} ({tree.Count} nodes)");
+        }
+        catch (InvalidDataException ex)
+        {
+            // A corrupt latest session must not block starting up — start fresh, loudly.
+            Console.WriteLine($"could not continue '{latest.Id}': {ex.Message}");
+            Console.WriteLine("starting a fresh session instead.");
+        }
     }
 }
 
@@ -399,7 +408,9 @@ async Task HandleCommandAsync(string input)
 
         case "/resume":
             if (arg.Length == 0) { Console.WriteLine("  usage: /resume <id>"); break; }
-            var loaded = store.Load(arg);
+            SessionTree? loaded;
+            try { loaded = store.Load(arg); }
+            catch (InvalidDataException ex) { Console.WriteLine($"  cannot resume '{arg}': {ex.Message}"); break; }
             if (loaded is null) { Console.WriteLine($"  no session '{arg}'"); break; }
             tree = loaded;
             sessionId = arg;
@@ -427,7 +438,7 @@ async Task HandleCommandAsync(string input)
 
         case "/goto":
             if (arg.Length == 0) { Console.WriteLine("  usage: /goto <node-id>"); break; }
-            if (!tree.Goto(arg)) { Console.WriteLine($"  no node '{arg}' — see /tree"); break; }
+            if (!tree.Goto(arg)) { Console.WriteLine($"  no node '{arg}', or it is mid-turn (unanswered tool_use) — see /tree"); break; }
             if (tree.Count > 0) sessionId = store.Save(sessionId, tree);
             Console.WriteLine($"  head now {arg}");
             break;

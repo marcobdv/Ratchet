@@ -105,7 +105,10 @@ public sealed class FileHandoverStore
         var path = Path.Combine(_dir, SessionId.Validate(h.SourceSessionId) + ".md");
         var header = $"{HeaderTag} source={h.SourceSessionId} head={h.SourceHeadId ?? "-"} " +
                      $"created={h.CreatedUtc.ToString("o", CultureInfo.InvariantCulture)} -->";
-        File.WriteAllText(path, header + "\n\n" + h.Content + "\n");
+        // Atomic replace, same as the session store: never destroy a good copy mid-write.
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, header + "\n\n" + h.Content + "\n");
+        File.Move(tmp, path, overwrite: true);
         return path;
     }
 

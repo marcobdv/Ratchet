@@ -41,6 +41,7 @@ public sealed class SessionTree
     /// </summary>
     public void RewindTurns(int n)
     {
+        if (n < 1) return; // 0/negative must be a no-op, not a wipe-to-root
         var removed = 0;
         for (var cur = HeadId; cur is not null; cur = _nodes[cur].ParentId)
         {
@@ -50,10 +51,17 @@ public sealed class SessionTree
         HeadId = null; // fewer than n prompts — rewind to empty (a fresh root)
     }
 
-    /// <summary>Point HEAD at an explicit node. Returns false if it doesn't exist.</summary>
+    /// <summary>
+    /// Point HEAD at an explicit node. Returns false if it doesn't exist — or if it
+    /// isn't a valid continuation point: a node whose message carries tool_use blocks
+    /// is mid-turn, and continuing from it with a user prompt would leave those
+    /// tool_use ids unanswered (the API then rejects every subsequent call). The same
+    /// invariant RewindTurns protects by landing only on turn boundaries.
+    /// </summary>
     public bool Goto(string nodeId)
     {
-        if (!_nodes.ContainsKey(nodeId)) return false;
+        if (!_nodes.TryGetValue(nodeId, out var node)) return false;
+        if (node.Message.Content.Any(b => b is ToolUseBlock)) return false;
         HeadId = nodeId;
         return true;
     }
@@ -78,7 +86,12 @@ public sealed class SessionTree
               .OrderBy(n => int.TryParse(n.Id, out var v) ? v : 0)
               .ToList();
 
-    /// <summary>Rebuild a tree from persisted nodes, continuing the id counter.</summary>
+    /// <summary>
+    /// Rebuild a tree from persisted nodes, continuing the id counter. Session files
+    /// are hand-editable JSON, so the structure is validated on load: every parent and
+    /// the head must resolve, and the path from head must terminate — a dangling id
+    /// would otherwise crash mid-walk and a parent cycle would loop forever.
+    /// </summary>
     public static SessionTree FromNodes(IEnumerable<Node> nodes, string? head)
     {
         var t = new SessionTree();
@@ -88,6 +101,20 @@ public sealed class SessionTree
             t._nodes[n.Id] = n;
             if (int.TryParse(n.Id, out var v) && v > max) max = v;
         }
+
+        foreach (var n in t._nodes.Values)
+            if (n.ParentId is not null && !t._nodes.ContainsKey(n.ParentId))
+                throw new InvalidDataException(
+                    $"Session tree is corrupt: node '{n.Id}' references missing parent '{n.ParentId}'.");
+        if (head is not null && !t._nodes.ContainsKey(head))
+            throw new InvalidDataException($"Session tree is corrupt: head '{head}' is not a node.");
+
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        for (var id = head; id is not null; id = t._nodes[id].ParentId)
+            if (!visited.Add(id))
+                throw new InvalidDataException(
+                    $"Session tree is corrupt: parent cycle through node '{id}'.");
+
         t._counter = max;
         t.HeadId = head;
         return t;
@@ -192,7 +219,12 @@ public sealed class FileSessionStore : ISessionStore
             w.WriteEndArray();
             w.WriteEndObject();
         }
-        File.WriteAllBytes(path, buffer.WrittenSpan.ToArray());
+        // Atomic replace: write the new copy beside the file, then swap. A crash
+        // mid-write must never destroy the previous good copy — Save runs after
+        // every turn, so in-place rewriting made every turn a data-loss window.
+        var tmp = path + ".tmp";
+        File.WriteAllBytes(tmp, buffer.WrittenSpan.ToArray());
+        File.Move(tmp, path, overwrite: true);
         return id;
     }
 
@@ -202,7 +234,15 @@ public sealed class FileSessionStore : ISessionStore
         var path = Path.Combine(_dir, id + ".json");
         if (!File.Exists(path)) return null;
 
-        using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
+        JsonDocument doc;
+        try { doc = JsonDocument.Parse(File.ReadAllBytes(path)); }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException(
+                $"Session file '{path}' is not valid JSON ({ex.Message}). " +
+                "Not loading it as empty — fix or remove the file.", ex);
+        }
+        using var _ = doc;
         var root = doc.RootElement;
 
         // Tree format (v0.3+).
@@ -230,7 +270,11 @@ public sealed class FileSessionStore : ISessionStore
             return tree;
         }
 
-        return new SessionTree();
+        // A parseable file matching neither schema must refuse, not load as an empty
+        // tree — the next auto-save would overwrite the file with that emptiness,
+        // turning "unrecognized format" into silent, permanent data loss.
+        throw new InvalidDataException(
+            $"Session file '{path}' has neither 'nodes' nor 'messages' — unrecognized format; refusing to load.");
     }
 
     public IReadOnlyList<SessionInfo> List()
