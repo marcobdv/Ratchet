@@ -12,17 +12,73 @@ namespace CodeStack.Ratchet.Core;
 ///   - A <b>sub-agent</b> (e.g. "explore") is given a read-only-ish tool subset and does work.
 ///   - An <b>advisor</b> is given no tools and returns a focused second opinion.
 /// </summary>
+/// <summary>
+/// Guards against runaway nested delegation (a sub-agent that spawns a team that spawns
+/// sub-agents…). Depth flows down async contexts via <see cref="AsyncLocal{T}"/>; a change
+/// in one member's flow is invisible to its siblings, so it counts nesting, not fan-out width.
+/// </summary>
+internal static class Delegation
+{
+    private static readonly AsyncLocal<int> _depth = new();
+
+    /// <summary>Maximum nesting of delegate/team calls. Test hook.</summary>
+    internal static int MaxDepth = 3;
+
+    public static int Depth => _depth.Value;
+    public static bool AtLimit => _depth.Value >= MaxDepth;
+
+    public static IDisposable Enter()
+    {
+        _depth.Value++;
+        return new Pop();
+    }
+
+    private sealed class Pop : IDisposable
+    {
+        private bool _done;
+        public void Dispose() { if (!_done) { _done = true; _depth.Value--; } }
+    }
+}
+
+/// <summary>
+/// Bounds a nested agent's tool loop by counting assistant turns through the observer seam
+/// and cancelling once the budget is hit — a looping delegate can't burn tokens forever, and
+/// the loop itself stays untouched (the cap lives on <see cref="IAgentObserver"/>).
+/// </summary>
+internal sealed class BudgetObserver : IAgentObserver
+{
+    private readonly int _maxTurns;
+    private readonly CancellationTokenSource _cts;
+    private int _turns;
+
+    public BudgetObserver(int maxTurns, CancellationTokenSource cts) { _maxTurns = maxTurns; _cts = cts; }
+
+    public void OnMessageAppended(Message message)
+    {
+        if (message.Role == Role.Assistant && ++_turns >= _maxTurns)
+            _cts.Cancel();
+    }
+
+    public void OnAssistantTextDelta(string delta) { }
+    public void OnAssistantTextEnd() { }
+    public void OnToolCall(string toolName, string inputJson) { }
+    public void OnToolResult(string toolName, string content, bool isError) { }
+    public void OnUsage(int inputTokens, int outputTokens) { }
+}
+
 public sealed class DelegateTool : ITool
 {
     private readonly ILlmClient _llm;
     private readonly string _systemPrompt;
     private readonly IReadOnlyList<ITool> _tools;
     private readonly IToolGate _gate;
+    private readonly int _maxTurns;
 
     /// <param name="gate">Scopes the delegate to its role — e.g. a <see cref="ReadOnlyGate"/> for an
     /// investigator. Defaults to <see cref="AllowAllGate"/> (the nested agent is as free as the parent).</param>
+    /// <param name="maxTurns">Iteration ceiling for the nested loop (a runaway delegate is cut off).</param>
     public DelegateTool(string name, string description, string systemPrompt, ILlmClient llm,
-        IReadOnlyList<ITool> tools, IToolGate? gate = null)
+        IReadOnlyList<ITool> tools, IToolGate? gate = null, int maxTurns = 16)
     {
         Name = name;
         Description = description;
@@ -30,6 +86,7 @@ public sealed class DelegateTool : ITool
         _llm = llm;
         _tools = tools;
         _gate = gate ?? AllowAllGate.Instance;
+        _maxTurns = maxTurns;
     }
 
     public string Name { get; }
@@ -42,13 +99,26 @@ public sealed class DelegateTool : ITool
     public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
     {
         var task = Json.GetString(inputJson, "task");
+        if (Delegation.AtLimit)
+            return $"(delegation refused: nesting limit {Delegation.MaxDepth} reached — a delegate cannot keep spawning delegates)";
+        using var _ = Delegation.Enter();
 
         var conversation = new Conversation();
         conversation.Add(Message.UserText(task));
 
+        // Own budget: cancel this delegate's loop after _maxTurns without touching the
+        // caller's token. Its own cancellation is not an error — return what it produced.
+        using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var registry = new ToolRegistry(_tools);
-        var agent = new Agent(_llm, registry, _systemPrompt, NullObserver.Instance, _gate);
-        await agent.RunTurnAsync(conversation, ct);
+        var agent = new Agent(_llm, registry, _systemPrompt, new BudgetObserver(_maxTurns, budgetCts), _gate);
+        try
+        {
+            await agent.RunTurnAsync(conversation, budgetCts.Token);
+        }
+        catch (OperationCanceledException) when (budgetCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            // Hit its own iteration budget — fall through and return the partial work.
+        }
 
         var text = LastAssistantText(conversation);
         return string.IsNullOrWhiteSpace(text) ? "(the delegate returned no text)" : text;

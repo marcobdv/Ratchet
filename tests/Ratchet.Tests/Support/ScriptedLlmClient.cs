@@ -39,6 +39,7 @@ public sealed class ScriptedLlmClient : ILlmClient
         Action<string> onTextDelta,
         CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();   // honor cancellation, as the real clients do
         SystemPrompts.Add(systemPrompt);
         CallTranscripts.Add(conversation.Messages.ToList());
         if (_script.Count == 0)

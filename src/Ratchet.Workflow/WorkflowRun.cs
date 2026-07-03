@@ -174,25 +174,35 @@ public sealed class TierCost
 /// </summary>
 public sealed class CostTally
 {
+    // Parallel dispatch (teams / council) meters several tiers concurrently, so the
+    // accumulation is guarded — an unsynchronized Dictionary mutation would race.
+    private readonly object _lock = new();
+
     public Dictionary<string, TierCost> ByTier { get; set; } = new(StringComparer.Ordinal);
 
     public void Add(string tier, long inputTokens, long outputTokens)
     {
-        var c = Entry(tier);
-        c.InputTokens += inputTokens;
-        c.OutputTokens += outputTokens;
-        c.Calls++;
+        lock (_lock)
+        {
+            var c = Entry(tier);
+            c.InputTokens += inputTokens;
+            c.OutputTokens += outputTokens;
+            c.Calls++;
+        }
     }
 
     /// <summary>Fold another tally in (used when rehydrating a resumed run).</summary>
     public void Merge(CostTally other)
     {
-        foreach (var (tier, c) in other.ByTier)
+        lock (_lock)
         {
-            var e = Entry(tier);
-            e.InputTokens += c.InputTokens;
-            e.OutputTokens += c.OutputTokens;
-            e.Calls += c.Calls;
+            foreach (var (tier, c) in other.ByTier)
+            {
+                var e = Entry(tier);
+                e.InputTokens += c.InputTokens;
+                e.OutputTokens += c.OutputTokens;
+                e.Calls += c.Calls;
+            }
         }
     }
 
