@@ -208,6 +208,12 @@ $env:RATCHET_MODEL = "anthropic/claude-sonnet-4"   # or openai/gpt-4o, google/ge
 dotnet run --project src/Ratchet.Cli
 ```
 
+**Which models are available?** `ratchet --models` queries every *configured* provider's
+model-list endpoint and prints what each offers (so with a local server and OpenRouter both
+set, you see both catalogs at once); `ratchet --models <substr>` filters. Individual agents
+can then pick a backend per-agent via `provider:` / `model:` — see
+[`docs/agent-teams.md`](docs/agent-teams.md).
+
 ### In-session commands
 
 `/sessions`, `/resume <id>`, `/new`, `/tree` (show the branch tree), `/rewind [n]`

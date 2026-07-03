@@ -22,6 +22,7 @@ name: code-reviewer
 description: Reviews a diff for correctness, convention, and regression risk.
 tools: read, search, git_diff        # omit → default read-only set (read, search, recall)
 model: opus                          # omit / "inherit" → the top-level model; alias or id
+provider: anthropic                  # omit → the top-level provider; else this agent's backend
 ---
 You are a meticulous code reviewer. Read the diff, then report findings as a prioritized
 list: correctness bugs first, then convention and scope. Cite file:line.
@@ -31,9 +32,14 @@ Each becomes a named tool (`code-reviewer`) the top-level agent can call. It run
 **own fresh context** — pass it all the context it needs; it does not see your conversation.
 Tools are resolved by name from the host's set; an all-read-only tool list runs under a
 deny-by-default `ReadOnlyGate` (scoped by structure, [ADR-0009](adr/0009-readonly-subagents-by-structure.md)).
-`model:` accepts `sonnet` / `opus` / `haiku` aliases or any backend model id, resolved
-through the provider seam — so different agents can run on different models (and, when your
-local inference is up, different local models).
+
+**Model & provider per agent.** `model:` accepts `sonnet` / `opus` / `haiku` aliases or any
+backend model id. `provider:` gives the agent its **own backend** (`local`, `openrouter`,
+`openai`, `groq`, `anthropic`, …) — so one persona can run on your local server and another
+on OpenRouter *in the same council*. Shorthand: put both in `model:` as `provider:model`
+(e.g. `model: openrouter:anthropic/claude-sonnet-4`) — the first colon splits them. Not sure
+what to write? `ratchet --models` lists what every configured provider actually offers
+(`ratchet --models sonnet` to filter).
 
 ## Teams
 

@@ -16,7 +16,8 @@ public sealed record AgentDefinition(
     string? Model,                  // null / "inherit" = use the parent's model
     string SystemPrompt,
     IReadOnlyList<string>? Members = null,   // non-empty = a team or council, not a solo agent
-    string? Mode = null)                     // "council" = deliberation protocol; else a merging team
+    string? Mode = null,                     // "council" = deliberation protocol; else a merging team
+    string? Provider = null)                 // null = the top-level provider; else this agent's own backend
 {
     public bool HasMembers => Members is { Count: > 0 };
     public bool IsCouncil => HasMembers && string.Equals(Mode, "council", StringComparison.OrdinalIgnoreCase);
@@ -73,6 +74,16 @@ public sealed class AgentCatalog
             var model = meta.TryGetValue("model", out var m) && m.Length > 0 && !m.Equals("inherit", StringComparison.OrdinalIgnoreCase)
                 ? m : null;
 
+            // provider: an explicit backend for this agent (local, openrouter, …), or a
+            // "provider:model" prefix on the model value (openrouter model ids contain '/',
+            // so the first ':' unambiguously splits provider from model).
+            var provider = meta.TryGetValue("provider", out var pv) && pv.Length > 0 ? pv.ToLowerInvariant() : null;
+            if (provider is null && model is not null)
+            {
+                var colon = model.IndexOf(':');
+                if (colon > 0) { provider = model[..colon].Trim().ToLowerInvariant(); model = model[(colon + 1)..].Trim(); }
+            }
+
             IReadOnlyList<string>? tools = null;
             if (meta.TryGetValue("tools", out var t) && t.Trim().Length > 0)
                 tools = t.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -86,7 +97,7 @@ public sealed class AgentCatalog
 
             // A team/council may have an empty body (defaults apply); a solo agent needs a prompt.
             if (members is null && string.IsNullOrWhiteSpace(body)) return null;
-            return new AgentDefinition(name, description, tools, model, body.Trim(), members, mode);
+            return new AgentDefinition(name, description, tools, model, body.Trim(), members, mode, provider);
         }
         catch
         {
@@ -105,10 +116,13 @@ public static partial class SubAgents
     /// gate. The model is resolved per definition, falling back to <paramref name="defaultLlm"/>.
     /// Names colliding with an existing tool are skipped (the registry forbids duplicates).
     /// </summary>
+    /// <param name="resolveClient">Maps an agent's (provider, model) — either may be null to
+    /// inherit the top-level default — to an <see cref="ILlmClient"/>. This is where per-agent
+    /// multi-provider selection happens (a local persona alongside an OpenRouter one).</param>
     public static IEnumerable<ITool> BuildFromCatalog(
         AgentCatalog catalog,
         Func<string, ITool?> resolveTool,
-        Func<string?, ILlmClient> resolveClient,
+        Func<string?, string?, ILlmClient> resolveClient,
         ILlmClient defaultLlm,
         IToolGate parentGate,
         ISet<string> reservedNames,
@@ -139,7 +153,7 @@ public static partial class SubAgents
                 string.IsNullOrWhiteSpace(def.Description)
                     ? $"Delegate a task to the '{def.Name}' sub-agent (runs in its own context, returns findings)."
                     : def.Description,
-                def.SystemPrompt, resolveClient(def.Model), tools, gate);
+                def.SystemPrompt, resolveClient(def.Provider, def.Model), tools, gate);
             built.Add(tool);
             byName[toolName] = tool;
         }
@@ -167,7 +181,7 @@ public static partial class SubAgents
                 continue;
             }
 
-            var coordinator = resolveClient(def.Model);
+            var coordinator = resolveClient(def.Provider, def.Model);
             var members = def.Members!.Select(m => ResolveMember(m, coordinator)).OfType<ITool>().ToList();
             if (members.Count == 0)
             {

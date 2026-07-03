@@ -32,6 +32,18 @@ if (args.Contains("--roslyn-check"))
     return 0;
 }
 
+// `ratchet --models` lists the models each CONFIGURED provider actually offers, by querying
+// its list endpoint. A provider counts as configured when its key (or local base URL) is in the
+// env — so with, say, RATCHET_LOCAL_BASE_URL and OPENROUTER_API_KEY both set, you see both
+// catalogs at once. Use these ids in RATCHET_MODEL or an agent's model:/provider:.
+if (args.Contains("--models"))
+{
+    var filter = "";
+    var mIdx = Array.IndexOf(args, "--models");
+    if (mIdx >= 0 && mIdx + 1 < args.Length && !args[mIdx + 1].StartsWith('-')) filter = args[mIdx + 1];
+    return await ModelCatalog.PrintAsync(filter);
+}
+
 // Inspect persisted workflow runs (read-only; no API key needed).
 if (args.Contains("--runs"))
 {
@@ -206,18 +218,21 @@ if (agentCatalog.Agents.Count > 0)
     foreach (var t in baseTools) agentToolByName[t.Name] = t;
     var reserved = new HashSet<string>(agentToolByName.Keys, StringComparer.Ordinal);
 
-    ILlmClient ResolveAgentClient(string? agentModel)
+    ILlmClient ResolveAgentClient(string? agentProvider, string? agentModel)
     {
-        if (string.IsNullOrWhiteSpace(agentModel)) return llm;   // inherit the parent's model
+        // Inherit the top-level model only when neither provider nor model is specified.
+        if (string.IsNullOrWhiteSpace(agentProvider) && string.IsNullOrWhiteSpace(agentModel)) return llm;
+        var prov = string.IsNullOrWhiteSpace(agentProvider) ? provider : agentProvider!.Trim().ToLowerInvariant();
+        var mdl = string.IsNullOrWhiteSpace(agentModel) ? (DefaultModelFor(prov) ?? model) : MapModelAlias(prov, agentModel!);
         try
         {
-            var c = ResolveClient(provider, MapModelAlias(provider, agentModel!));
+            var c = ResolveClient(prov, mdl);
             if (c is IDisposable d) agentClients.Add(d);
             return c;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"agent model '{agentModel}' unavailable ({ex.Message}); using the default model.");
+            Console.Error.WriteLine($"agent model '{prov}:{mdl}' unavailable ({ex.Message}); using the default model.");
             return llm;
         }
     }

@@ -168,7 +168,7 @@ public sealed class CouncilBuilderTests : IDisposable
             Members: new[] { "architect", "skeptic", "developer", "domain" }, Mode: "council"));
 
         var tools = SubAgents.BuildFromCatalog(
-            cat, _ => null, _ => new ScriptedLlmClient(), new ScriptedLlmClient(),
+            cat, _ => null, (_, _) => new ScriptedLlmClient(), new ScriptedLlmClient(),
             AllowAllGate.Instance, new HashSet<string>(StringComparer.Ordinal), _dir).ToList();
 
         var council = Assert.Single(tools);
@@ -186,7 +186,7 @@ public sealed class CouncilBuilderTests : IDisposable
             Members: new[] { "architect", "skeptic" }, Mode: "council"));
 
         var tools = SubAgents.BuildFromCatalog(
-            cat, _ => null, _ => new ScriptedLlmClient(), new ScriptedLlmClient(),
+            cat, _ => null, (_, _) => new ScriptedLlmClient(), new ScriptedLlmClient(),
             AllowAllGate.Instance, new HashSet<string>(StringComparer.Ordinal), _dir).ToList();
 
         Assert.IsType<TeamTool>(tools.Single(t => t.Name == "board"));

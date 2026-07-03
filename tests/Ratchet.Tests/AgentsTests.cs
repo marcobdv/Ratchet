@@ -82,6 +82,38 @@ public sealed class AgentCatalogTests : IDisposable
     }
 
     [Fact]
+    public void ProviderField_SelectsAgentsOwnBackend()
+    {
+        var def = Discover("local-arch.md", """
+            ---
+            name: local-arch
+            description: d
+            provider: local
+            model: qwen2.5-coder:14b
+            ---
+            body
+            """).Find("local-arch");
+        Assert.Equal("local", def!.Provider);
+        Assert.Equal("qwen2.5-coder:14b", def.Model);
+    }
+
+    [Fact]
+    public void ProviderColonModelPrefix_SplitsOnTheFirstColon()
+    {
+        // OpenRouter ids contain '/', so the first ':' is the provider/model boundary.
+        var def = Discover("or.md", """
+            ---
+            name: or
+            description: d
+            model: openrouter:anthropic/claude-sonnet-4
+            ---
+            body
+            """).Find("or");
+        Assert.Equal("openrouter", def!.Provider);
+        Assert.Equal("anthropic/claude-sonnet-4", def.Model);
+    }
+
+    [Fact]
     public void FileWithNoBody_IsNotAUsableAgent()
     {
         var cat = Discover("empty.md", "---\nname: empty\ndescription: d\n---\n");
@@ -117,7 +149,7 @@ public sealed class AgentBuilderTests
             .Enqueue(ScriptedLlmClient.Text("Looks good."));
 
         var tools = SubAgents.BuildFromCatalog(
-            cat, Resolve, _ => innerLlm, innerLlm, AllowAllGate.Instance,
+            cat, Resolve, (_, _) => innerLlm, innerLlm, AllowAllGate.Instance,
             new HashSet<string>(StringComparer.Ordinal), Path.GetTempPath()).ToList();
 
         var reviewer = Assert.Single(tools);
@@ -136,7 +168,7 @@ public sealed class AgentBuilderTests
         var warnings = new List<string>();
 
         var tools = SubAgents.BuildFromCatalog(
-            cat, Resolve, _ => new ScriptedLlmClient(), new ScriptedLlmClient(), AllowAllGate.Instance,
+            cat, Resolve, (_, _) => new ScriptedLlmClient(), new ScriptedLlmClient(), AllowAllGate.Instance,
             new HashSet<string>(StringComparer.Ordinal) { "read" }, Path.GetTempPath(), warnings.Add).ToList();
 
         Assert.Empty(tools);
