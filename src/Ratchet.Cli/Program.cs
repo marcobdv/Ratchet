@@ -527,6 +527,40 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine("  started a new session");
             break;
 
+        case "/model":
+            if (arg.Length == 0)
+            {
+                Console.WriteLine($"  current: {provider} · {model}");
+                Console.WriteLine("  usage: /model <id> | /model <provider> <id> | /model <provider>:<id>   (see `ratchet --models`)");
+                break;
+            }
+            {
+                // Parse "<provider> <id>" | "<provider>:<id>" | "<id>" (keep current provider).
+                string newProvider = provider, newModel;
+                var sp = arg.IndexOf(' ');
+                var cl = arg.IndexOf(':');
+                if (sp > 0) { newProvider = arg[..sp].Trim().ToLowerInvariant(); newModel = arg[(sp + 1)..].Trim(); }
+                else if (cl > 0) { newProvider = arg[..cl].Trim().ToLowerInvariant(); newModel = arg[(cl + 1)..].Trim(); }
+                else { newModel = arg.Trim(); }
+                newModel = MapModelAlias(newProvider, newModel);
+                try
+                {
+                    var newClient = ResolveClient(newProvider, newModel);
+                    // Retire the old top-level client rather than dispose it now: a sub-agent that
+                    // inherited it is still holding it. It's freed at exit with the others.
+                    if (llm is IDisposable old) agentClients.Add(old);
+                    llm = newClient;
+                    provider = newProvider; model = newModel;
+                    agent = BuildAgent();   // rebuild the REPL agent on the new client
+                    Console.WriteLine($"  switched to {provider} · {model}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  cannot switch to {newProvider} · {newModel}: {ex.Message}");
+                }
+            }
+            break;
+
         case "/tree":
             PrintTree();
             break;
@@ -576,6 +610,7 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine("  /sessions       list saved sessions");
             Console.WriteLine("  /resume <id>    load a session and continue");
             Console.WriteLine("  /new            start a fresh session");
+            Console.WriteLine("  /model [id]     show or switch the model (e.g. /model opus, /model openrouter:openai/gpt-4o)");
             Console.WriteLine("  /tree           show the session tree (► marks HEAD)");
             Console.WriteLine("  /rewind [n]     move HEAD back n turns; continue to branch");
             Console.WriteLine("  /goto <node>    jump HEAD to a node (e.g. another branch tip)");

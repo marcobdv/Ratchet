@@ -216,7 +216,8 @@ can then pick a backend per-agent via `provider:` / `model:` — see
 
 ### In-session commands
 
-`/sessions`, `/resume <id>`, `/new`, `/tree` (show the branch tree), `/rewind [n]`
+`/sessions`, `/resume <id>`, `/new`, `/model [id]` (show or switch the model mid-session —
+`/model opus`, `/model openrouter:openai/gpt-4o`), `/tree` (show the branch tree), `/rewind [n]`
 (move HEAD back n turns), `/goto <node>` (jump to a branch tip), `/handover` (write a
 handover doc), `/handovers` (list them), `/compact` (fold this session into a handover
 and continue fresh), `/help`.
