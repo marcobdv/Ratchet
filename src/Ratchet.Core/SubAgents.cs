@@ -142,6 +142,25 @@ public sealed class DelegateTool : ITool
 /// <summary>Builds Ratchet's delegation tools: one investigative sub-agent and three advisors.</summary>
 public static partial class SubAgents
 {
+    /// <summary>
+    /// Dispatch one task to every member tool <b>in parallel</b>, each cold and independent,
+    /// and collect their labelled outputs. A member that throws yields an error string rather
+    /// than sinking the group (caller cancellation still propagates). Shared by teams and the
+    /// council — the fan-out both need, in one place.
+    /// </summary>
+    internal static async Task<IReadOnlyList<(string Member, string Output)>> DispatchParallelAsync(
+        IReadOnlyList<ITool> members, string task, CancellationToken ct)
+    {
+        var input = System.Text.Json.JsonSerializer.Serialize(new { task });
+        var results = await Task.WhenAll(members.Select(async m =>
+        {
+            try { return (m.Name, Output: await m.ExecuteAsync(input, ct).ConfigureAwait(false)); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex) { return (m.Name, Output: $"[member '{m.Name}' failed: {ex.Message}]"); }
+        })).ConfigureAwait(false);
+        return results;
+    }
+
     /// <param name="root">The workspace the explore sub-agent is confined to
     /// (default: the current directory).</param>
     public static IEnumerable<ITool> Build(ILlmClient llm, string? root = null)

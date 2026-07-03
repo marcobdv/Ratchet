@@ -118,7 +118,7 @@ public sealed class AgentBuilderTests
 
         var tools = SubAgents.BuildFromCatalog(
             cat, Resolve, _ => innerLlm, innerLlm, AllowAllGate.Instance,
-            new HashSet<string>(StringComparer.Ordinal)).ToList();
+            new HashSet<string>(StringComparer.Ordinal), Path.GetTempPath()).ToList();
 
         var reviewer = Assert.Single(tools);
         Assert.Equal("reviewer", reviewer.Name);
@@ -137,7 +137,7 @@ public sealed class AgentBuilderTests
 
         var tools = SubAgents.BuildFromCatalog(
             cat, Resolve, _ => new ScriptedLlmClient(), new ScriptedLlmClient(), AllowAllGate.Instance,
-            new HashSet<string>(StringComparer.Ordinal) { "read" }, warnings.Add).ToList();
+            new HashSet<string>(StringComparer.Ordinal) { "read" }, Path.GetTempPath(), warnings.Add).ToList();
 
         Assert.Empty(tools);
         Assert.Contains(warnings, w => w.Contains("collides"));

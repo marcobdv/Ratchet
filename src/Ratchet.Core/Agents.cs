@@ -15,9 +15,12 @@ public sealed record AgentDefinition(
     IReadOnlyList<string>? Tools,   // null = the default investigative (read-only) set
     string? Model,                  // null / "inherit" = use the parent's model
     string SystemPrompt,
-    IReadOnlyList<string>? Members = null)   // non-empty = this is a team, not a solo agent
+    IReadOnlyList<string>? Members = null,   // non-empty = a team or council, not a solo agent
+    string? Mode = null)                     // "council" = deliberation protocol; else a merging team
 {
-    public bool IsTeam => Members is { Count: > 0 };
+    public bool HasMembers => Members is { Count: > 0 };
+    public bool IsCouncil => HasMembers && string.Equals(Mode, "council", StringComparison.OrdinalIgnoreCase);
+    public bool IsTeam => HasMembers && !IsCouncil;
 }
 
 /// <summary>
@@ -79,11 +82,11 @@ public sealed class AgentCatalog
             IReadOnlyList<string>? members = null;
             if (meta.TryGetValue("members", out var mem) && mem.Trim().Length > 0)
                 members = mem.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+            var mode = meta.TryGetValue("mode", out var md) && md.Length > 0 ? md.ToLowerInvariant() : null;
 
-            // A team may have an empty body (the synthesis prompt has a sensible default);
-            // a solo agent needs a prompt body to be usable.
+            // A team/council may have an empty body (defaults apply); a solo agent needs a prompt.
             if (members is null && string.IsNullOrWhiteSpace(body)) return null;
-            return new AgentDefinition(name, description, tools, model, body.Trim(), members);
+            return new AgentDefinition(name, description, tools, model, body.Trim(), members, mode);
         }
         catch
         {
@@ -109,15 +112,16 @@ public static partial class SubAgents
         ILlmClient defaultLlm,
         IToolGate parentGate,
         ISet<string> reservedNames,
+        string workspaceDir,
         Action<string>? log = null)
     {
         var defaultToolNames = new[] { "read", "search", "recall" };
         var built = new List<ITool>();
         var byName = new Dictionary<string, ITool>(StringComparer.Ordinal);
 
-        // Pass 1: solo agents. Teams resolve their members from these + the base tools, so
-        // the solos must exist first.
-        foreach (var def in catalog.Agents.Where(a => !a.IsTeam))
+        // Pass 1: solo agents. Teams and councils resolve their members from these + the base
+        // tools, so the solos must exist first.
+        foreach (var def in catalog.Agents.Where(a => !a.HasMembers))
         {
             var toolName = Sanitize(def.Name);
             if (!reservedNames.Add(toolName))
@@ -140,32 +144,57 @@ public static partial class SubAgents
             byName[toolName] = tool;
         }
 
-        // Pass 2: teams. A member resolves against the pass-1 agents first, then the base tools.
-        ITool? ResolveMember(string n) => byName.GetValueOrDefault(Sanitize(n)) ?? byName.GetValueOrDefault(n) ?? resolveTool(n);
-        foreach (var def in catalog.Agents.Where(a => a.IsTeam))
+        // Pass 2: teams and councils. A member resolves against the pass-1 agents, then the base
+        // tools, then the built-in council personas (so a council works out of the box). A council
+        // member gets its own model when defined as an agent (Council of Reeds); a built-in
+        // fallback persona runs on the coordinator's model.
+        ITool BuiltinPersona(string n, ILlmClient llm)
+        {
+            var p = CouncilPersonas.Find(n)!;
+            return new DelegateTool(Sanitize(p.Name), $"Council persona: {p.Lens}.", p.Prompt, llm, Array.Empty<ITool>());
+        }
+        ITool? ResolveMember(string n, ILlmClient fallbackLlm) =>
+            byName.GetValueOrDefault(Sanitize(n)) ?? byName.GetValueOrDefault(n) ?? resolveTool(n)
+            ?? (CouncilPersonas.IsBuiltin(n) ? BuiltinPersona(n, fallbackLlm) : null);
+
+        foreach (var def in catalog.Agents.Where(a => a.HasMembers))
         {
             var toolName = Sanitize(def.Name);
+            var kind = def.IsCouncil ? "council" : "team";
             if (!reservedNames.Add(toolName))
             {
-                log?.Invoke($"team '{def.Name}': name collides with an existing tool — skipped.");
+                log?.Invoke($"{kind} '{def.Name}': name collides with an existing tool — skipped.");
                 continue;
             }
 
-            var members = def.Members!.Select(ResolveMember).OfType<ITool>().ToList();
+            var coordinator = resolveClient(def.Model);
+            var members = def.Members!.Select(m => ResolveMember(m, coordinator)).OfType<ITool>().ToList();
             if (members.Count == 0)
             {
-                log?.Invoke($"team '{def.Name}': none of its members [{string.Join(", ", def.Members!)}] resolved — skipped.");
+                log?.Invoke($"{kind} '{def.Name}': none of its members [{string.Join(", ", def.Members!)}] resolved — skipped.");
                 continue;
             }
 
-            built.Add(new TeamTool(
-                toolName,
-                string.IsNullOrWhiteSpace(def.Description)
-                    ? $"Dispatch a task to the '{def.Name}' team ({members.Count} members, in parallel) and return a merged result."
-                    : def.Description,
-                members,
-                lead: resolveClient(def.Model),
-                synthesisPrompt: string.IsNullOrWhiteSpace(def.SystemPrompt) ? null : def.SystemPrompt));
+            if (def.IsCouncil)
+            {
+                built.Add(new CouncilTool(
+                    toolName,
+                    string.IsNullOrWhiteSpace(def.Description)
+                        ? $"Deliberate an architectural decision with the '{def.Name}' council ({members.Count} independent personas) and emit an Analysis Brief + Decision Record."
+                        : def.Description,
+                    members, coordinator, workspaceDir));
+            }
+            else
+            {
+                built.Add(new TeamTool(
+                    toolName,
+                    string.IsNullOrWhiteSpace(def.Description)
+                        ? $"Dispatch a task to the '{def.Name}' team ({members.Count} members, in parallel) and return a merged result."
+                        : def.Description,
+                    members,
+                    lead: coordinator,
+                    synthesisPrompt: string.IsNullOrWhiteSpace(def.SystemPrompt) ? null : def.SystemPrompt));
+            }
         }
 
         return built;
@@ -215,16 +244,7 @@ public sealed class TeamTool : ITool
             return $"(team refused: nesting limit {Delegation.MaxDepth} reached)";
         using var _ = Delegation.Enter();
 
-        var memberInput = System.Text.Json.JsonSerializer.Serialize(new { task });
-
-        // Fan out. Each member runs independently; a member that throws yields an error
-        // string rather than sinking the whole team.
-        var results = await Task.WhenAll(_members.Select(async m =>
-        {
-            try { return (m.Name, Output: await m.ExecuteAsync(memberInput, ct).ConfigureAwait(false)); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception ex) { return (m.Name, Output: $"[member '{m.Name}' failed: {ex.Message}]"); }
-        })).ConfigureAwait(false);
+        var results = await SubAgents.DispatchParallelAsync(_members, task, ct);
 
         var labelled = new StringBuilder();
         foreach (var (member, output) in results)

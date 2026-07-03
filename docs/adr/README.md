@@ -31,6 +31,7 @@ think X" survives.
 | [0008](0008-telemetry-on-bcl-in-core.md) | Telemetry on BCL diagnostics in Core; the OTel SDK only in the CLI | v0.11 | Accepted |
 | [0009](0009-readonly-subagents-by-structure.md) | YOLO by default, but delegated sub-agents are scoped read-only by *structure* | v0.9 / v0.11 | Accepted |
 | [0010](0010-stop-reason-policy-at-the-loop-boundary.md) | A stop-reason policy at the loop boundary (orphaned tool_use is closed, truncation refuses loudly) | v0.12 | Accepted |
+| [0011](0011-delegation-family-one-seam.md) | Sub-agents, teams, and council are one seam at three altitudes (council keeps the human in the synthesis seat) | v0.13 | Accepted |
 
 ## The through-line
 

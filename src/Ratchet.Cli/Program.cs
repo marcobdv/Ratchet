@@ -224,7 +224,7 @@ if (agentCatalog.Agents.Count > 0)
 
     var loaded = SubAgents.BuildFromCatalog(
         agentCatalog, n => agentToolByName.GetValueOrDefault(n),
-        ResolveAgentClient, llm, gate, reserved, Console.WriteLine).ToList();
+        ResolveAgentClient, llm, gate, reserved, Directory.GetCurrentDirectory(), Console.WriteLine).ToList();
     baseTools.AddRange(loaded);
     if (loaded.Count > 0)
         Console.WriteLine($"agents: loaded {loaded.Count} ({string.Join(", ", loaded.Select(t => t.Name))})");

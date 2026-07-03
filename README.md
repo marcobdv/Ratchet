@@ -370,6 +370,7 @@ landed in:
 | v0.10 | [ADR-0007](docs/adr/0007-two-layer-routing-not-a-router.md) two-layer model routing (predictive + reactive), not a router |
 | v0.11 | [ADR-0008](docs/adr/0008-telemetry-on-bcl-in-core.md) telemetry on BCL diagnostics in Core; the SDK only in the CLI · [ADR-0009](docs/adr/0009-readonly-subagents-by-structure.md) YOLO by default, but sub-agents scoped read-only by structure |
 | v0.12 | [ADR-0010](docs/adr/0010-stop-reason-policy-at-the-loop-boundary.md) a stop-reason policy at the loop boundary — the one deliberate loop edit, to keep the transcript valid when a response is cut off mid-tool-call |
+| v0.13 | [ADR-0011](docs/adr/0011-delegation-family-one-seam.md) sub-agents, teams, and council are one seam at three altitudes; council keeps the human in the synthesis seat |
 
 ## 🚫 What it deliberately does NOT do
 
@@ -576,6 +577,24 @@ in its prompt.
 >   *scoped* to the workspace, making [ADR-0009](docs/adr/0009-readonly-subagents-by-structure.md)'s
 >   "scoped by structure" true in mechanism, not just by gate. The loop's control flow is unchanged;
 >   everything else grew on a seam, exactly as the design always promised.
+>
+> **v0.13 — the delegation family: sub-agents, teams, and council.** One seam
+> (`DelegateTool`, a nested `Agent`) at three altitudes, all defined by the same
+> Claude-Code-compatible agent file (`.claude/agents` / `.ratchet/agents`; frontmatter
+> `name`/`description`/`tools`/`model`, prompt body). A file with no `members` is a **sub-agent**
+> (loaded, not hardcoded — the old `explore`/advisors generalize); with `members:` it's a **team**
+> that dispatches to all members *in parallel* and optionally has a lead synthesize; with
+> `members:` + `mode: council` it's **council mode** — a deliberation harness for architectural
+> decisions with no prior art. Council dispatches independent personas *cold to each other*, a
+> clerk organizes their *locked* outputs into an Analysis Brief (Consensus / Contradictions /
+> Partial coverage / Unique insights / Blind spots), and a **Decision Record** template is written
+> to `.ratchet/council/` for a human — the council organizes, the human decides. Per-member
+> `model:` routing gives the multi-model "Council of Reeds" through the provider seam; the built-in
+> architect/skeptic/developer/domain personas work out of the box. New safety rails ride existing
+> seams — a nesting-depth guard and a per-delegate iteration budget (via the observer), plus
+> lock-guarded parallel cost metering. The loop is untouched
+> ([ADR-0011](docs/adr/0011-delegation-family-one-seam.md); design in
+> [`docs/agent-teams.md`](docs/agent-teams.md)).
 
 ## 🛠️ Technologies
 
