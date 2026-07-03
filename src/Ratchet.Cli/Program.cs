@@ -230,6 +230,25 @@ if (agentCatalog.Agents.Count > 0)
         Console.WriteLine($"agents: loaded {loaded.Count} ({string.Join(", ", loaded.Select(t => t.Name))})");
 }
 
+// A built-in `council` tool for AD-HOC deliberation: convene a council with the roster named in
+// the call (defined agents and/or the built-in personas), no definition file needed. Skipped if a
+// user-defined agent already claims the name. Members resolve over the final tool set (loaded
+// agents included) + built-in personas on the default model.
+if (!baseTools.Any(t => t.Name == "council"))
+{
+    var finalByName = new Dictionary<string, ITool>(StringComparer.Ordinal);
+    foreach (var t in baseTools) finalByName[t.Name] = t;
+    var roster = CouncilPersonas.Roster(n => finalByName.GetValueOrDefault(n), llm);
+    baseTools.Add(new CouncilTool(
+        "council",
+        "Convene an ad-hoc deliberation council on an architectural decision with no prior art. " +
+        "Pass `decision` (with full context) and optionally `members` (names of defined agents and/or " +
+        "the built-in personas architect/skeptic/developer/domain; omit for the default four). Personas " +
+        "argue independently and cold; a clerk organizes them into an Analysis Brief and a Decision " +
+        "Record is written for you to complete.",
+        roster, adHoc: true, llm, Directory.GetCurrentDirectory()));
+}
+
 // OpenTelemetry: the agent/clients/workflow are instrumented in Core with the BCL
 // diagnostics API; here we wire the SDK + exporters. RATCHET_OTEL = off (default) |
 // console | otlp (to OTEL_EXPORTER_OTLP_ENDPOINT, default localhost:4317). Disposed at

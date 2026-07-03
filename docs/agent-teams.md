@@ -90,6 +90,22 @@ add an advisory recommendation rendered *after* the contradictions, so the human
 view before seeing the machine's — the same anchoring guard that keeps the personas honest,
 turned to protect the human.
 
+### Ad-hoc councils
+
+You don't need a definition file to convene one. A built-in **`council`** tool is always
+available; name the roster in the call itself:
+
+```
+you> Use the council tool on: should sync be a modular monolith or microservices?
+     members: backend-architect, infra-skeptic, domain
+```
+
+The `members` are resolved the same way as a defined council — your agents first, then the
+built-in personas — so you can assemble a roster on the spot. Omit `members` and it uses the
+default four personas. Use a **defined** council (a file) when the roster is stable and you
+want it named and reusable; use the ad-hoc `council` tool for a one-off deliberation.
+(If you define your own agent named `council`, it takes precedence and the built-in steps aside.)
+
 ### Built-in personas
 
 `architect` (structure/boundaries/maintainability), `skeptic` (simplicity/hidden

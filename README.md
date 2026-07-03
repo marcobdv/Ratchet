@@ -588,7 +588,9 @@ in its prompt.
 > decisions with no prior art. Council dispatches independent personas *cold to each other*, a
 > clerk organizes their *locked* outputs into an Analysis Brief (Consensus / Contradictions /
 > Partial coverage / Unique insights / Blind spots), and a **Decision Record** template is written
-> to `.ratchet/council/` for a human — the council organizes, the human decides. Per-member
+> to `.ratchet/council/` for a human — the council organizes, the human decides. A built-in
+> **`council`** tool also convenes an *ad-hoc* deliberation with the roster named in the call, no
+> file needed. Per-member
 > `model:` routing gives the multi-model "Council of Reeds" through the provider seam; the built-in
 > architect/skeptic/developer/domain personas work out of the box. New safety rails ride existing
 > seams — a nesting-depth guard and a per-delegate iteration budget (via the observer), plus

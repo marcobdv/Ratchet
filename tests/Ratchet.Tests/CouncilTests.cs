@@ -86,6 +86,56 @@ public sealed class CouncilToolTests : IDisposable
     }
 
     [Fact]
+    public async Task AdHoc_ResolvesTheRosterNamedInTheCall()
+    {
+        var architect = new Persona("architect", "monolith");
+        var infra = new Persona("infra", "watch ops cost");
+        var pool = new Dictionary<string, ITool>(StringComparer.Ordinal) { ["architect"] = architect, ["infra"] = infra };
+
+        var clerk = new ScriptedLlmClient().Enqueue(ScriptedLlmClient.Text("## Consensus\norganized"));
+        var roster = CouncilPersonas.Roster(n => pool.GetValueOrDefault(n), new ScriptedLlmClient());
+        var council = new CouncilTool("council", "ad-hoc", roster, adHoc: true, clerk, _dir);
+
+        var input = System.Text.Json.JsonSerializer.Serialize(new { decision = "how to build X", members = new[] { "architect", "infra" } });
+        var result = await council.ExecuteAsync(input, CancellationToken.None);
+
+        Assert.Equal("how to build X", architect.SawTask);   // both named members ran
+        Assert.Equal("how to build X", infra.SawTask);
+        Assert.Contains("organized", result);
+        Assert.Contains("members", council.InputSchemaJson);  // the ad-hoc schema advertises the roster
+    }
+
+    [Fact]
+    public async Task AdHoc_WithNoMembers_FallsBackToTheBuiltinFour()
+    {
+        // No pool agents resolve, so the four built-in personas are used — each runs on the
+        // persona model. Scripted to answer once per persona, then the clerk.
+        var personaLlm = new ScriptedLlmClient();
+        for (var i = 0; i < 4; i++) personaLlm.Enqueue(ScriptedLlmClient.Text($"view {i}"));
+        var clerk = new ScriptedLlmClient().Enqueue(ScriptedLlmClient.Text("## Consensus\nok"));
+
+        var roster = CouncilPersonas.Roster(_ => null, personaLlm);   // nothing resolves as an agent
+        var council = new CouncilTool("council", "ad-hoc", roster, adHoc: true, clerk, _dir);
+
+        var result = await council.ExecuteAsync("""{"decision":"pick a datastore"}""", CancellationToken.None);
+
+        Assert.Equal(4, personaLlm.CallTranscripts.Count);   // architect + skeptic + developer + domain
+        Assert.Contains("Decision Record", result);
+    }
+
+    [Fact]
+    public async Task AdHoc_UnknownMemberNames_ReportNoRosterResolved()
+    {
+        var roster = CouncilPersonas.Roster(_ => null, new ScriptedLlmClient());
+        var council = new CouncilTool("council", "ad-hoc", roster, adHoc: true, new ScriptedLlmClient(), _dir);
+
+        var input = System.Text.Json.JsonSerializer.Serialize(new { decision = "x", members = new[] { "nobody", "nothing" } });
+        var result = await council.ExecuteAsync(input, CancellationToken.None);
+
+        Assert.Contains("no members resolved", result);
+    }
+
+    [Fact]
     public async Task ClerkFailure_StillWritesTheRecord_WithTheRawPerspectives()
     {
         var p = new Persona("architect", "raw perspective survives");
