@@ -70,7 +70,7 @@ public sealed class DelegateTool : ITool
 }
 
 /// <summary>Builds Ratchet's delegation tools: one investigative sub-agent and three advisors.</summary>
-public static class SubAgents
+public static partial class SubAgents
 {
     /// <param name="root">The workspace the explore sub-agent is confined to
     /// (default: the current directory).</param>

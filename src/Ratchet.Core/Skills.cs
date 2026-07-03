@@ -69,14 +69,7 @@ public sealed class SkillCatalog
         var description = "";
         try
         {
-            var lines = File.ReadAllLines(skillFile);
-            if (lines.Length == 0 || lines[0].Trim() != "---") return (name, description);
-
-            var end = lines.Length;   // unterminated frontmatter: treat the rest as the block
-            for (var i = 1; i < lines.Length; i++)
-                if (lines[i].Trim() == "---") { end = i; break; }
-
-            var values = ParseYamlBlock(lines, 1, end);
+            var values = Frontmatter.ParseMeta(File.ReadAllLines(skillFile));
             if (values.TryGetValue("name", out var n) && n.Length > 0) name = n;
             if (values.TryGetValue("description", out var d)) description = d;
         }
@@ -85,64 +78,6 @@ public sealed class SkillCatalog
             // fall back to defaults on any IO/parse error
         }
         return (name, description);
-    }
-
-    /// <summary>
-    /// A deliberately small YAML reader for skill frontmatter: top-level <c>key: value</c>
-    /// plus block scalars (<c>key: |</c> literal, <c>key: &gt;</c> folded, with the usual
-    /// <c>+/-</c> chomping indicators). Real Claude skills routinely write a multi-line folded
-    /// <c>description: &gt;-</c>; the old single-line reader returned empty for those, silently
-    /// degrading skill selection. Not a general YAML parser — just what SKILL.md needs.
-    /// </summary>
-    private static Dictionary<string, string> ParseYamlBlock(string[] lines, int start, int end)
-    {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var i = start;
-        while (i < end)
-        {
-            var raw = lines[i];
-            var trimmed = raw.Trim();
-            if (trimmed.Length == 0 || trimmed.StartsWith('#')) { i++; continue; }
-
-            var keyIndent = Indent(raw);
-            var sep = trimmed.IndexOf(':');
-            if (sep <= 0) { i++; continue; }
-            var key = trimmed[..sep].Trim().ToLowerInvariant();
-            var rest = trimmed[(sep + 1)..].Trim();
-
-            if (rest.Length > 0 && (rest[0] == '|' || rest[0] == '>'))
-            {
-                // Block scalar: collect the following more-indented lines.
-                var folded = rest[0] == '>';
-                i++;
-                var body = new List<string>();
-                while (i < end)
-                {
-                    var bodyRaw = lines[i];
-                    if (bodyRaw.Trim().Length == 0) { body.Add(""); i++; continue; }
-                    if (Indent(bodyRaw) <= keyIndent) break;   // dedent → this key is done
-                    body.Add(bodyRaw.Trim());
-                    i++;
-                }
-                while (body.Count > 0 && body[^1].Length == 0) body.RemoveAt(body.Count - 1);
-                result[key] = folded
-                    ? string.Join(' ', body.Where(l => l.Length > 0))   // folded: newlines → spaces
-                    : string.Join('\n', body);                          // literal: newlines kept
-            }
-            else
-            {
-                result[key] = rest.Trim('"', '\'');
-                i++;
-            }
-        }
-        return result;
-    }
-
-    private static int Indent(string s)
-    {
-        var n = 0;
-        while (n < s.Length && s[n] == ' ') n++;
-        return n;
     }
 }
 

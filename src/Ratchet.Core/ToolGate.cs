@@ -49,6 +49,10 @@ public sealed class ReadOnlyGate : IToolGate
         "roslyn_diagnostics", "roslyn_find_symbol", "roslyn_find_references", "roslyn_outline",
     };
 
+    /// <summary>The tool names this gate permits — a read-only set other code can consult
+    /// (e.g. to infer whether a loaded agent's tool list is entirely non-mutating).</summary>
+    public static IReadOnlyCollection<string> AllowedTools => Allowed;
+
     public Task<ToolGateDecision> CheckAsync(string toolName, string inputJson, CancellationToken ct) =>
         Task.FromResult(Allowed.Contains(toolName)
             ? ToolGateDecision.Allow

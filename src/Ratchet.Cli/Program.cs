@@ -194,6 +194,42 @@ var observer = new ConsoleObserver();
 // (block them). Read-only tools always pass. Used by both the REPL agent and workflows.
 var gate = new ConsoleToolGate(Environment.GetEnvironmentVariable("RATCHET_GATE"));
 
+// Agent teams (the delegation family, Tier 1): load Claude-Code-style agent definitions
+// from .claude/agents and .ratchet/agents into named delegate tools. Each runs as its own
+// COLD sub-agent — its own context, tool subset, model, and (inferred) gate. Built after the
+// base tools so an agent can be given any of them by name.
+var agentClients = new List<IDisposable>();
+var agentCatalog = AgentCatalog.Discover(Directory.GetCurrentDirectory());
+if (agentCatalog.Agents.Count > 0)
+{
+    var agentToolByName = new Dictionary<string, ITool>(StringComparer.Ordinal);
+    foreach (var t in baseTools) agentToolByName[t.Name] = t;
+    var reserved = new HashSet<string>(agentToolByName.Keys, StringComparer.Ordinal);
+
+    ILlmClient ResolveAgentClient(string? agentModel)
+    {
+        if (string.IsNullOrWhiteSpace(agentModel)) return llm;   // inherit the parent's model
+        try
+        {
+            var c = ResolveClient(provider, MapModelAlias(provider, agentModel!));
+            if (c is IDisposable d) agentClients.Add(d);
+            return c;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"agent model '{agentModel}' unavailable ({ex.Message}); using the default model.");
+            return llm;
+        }
+    }
+
+    var loaded = SubAgents.BuildFromCatalog(
+        agentCatalog, n => agentToolByName.GetValueOrDefault(n),
+        ResolveAgentClient, llm, gate, reserved, Console.WriteLine).ToList();
+    baseTools.AddRange(loaded);
+    if (loaded.Count > 0)
+        Console.WriteLine($"agents: loaded {loaded.Count} ({string.Join(", ", loaded.Select(t => t.Name))})");
+}
+
 // OpenTelemetry: the agent/clients/workflow are instrumented in Core with the BCL
 // diagnostics API; here we wire the SDK + exporters. RATCHET_OTEL = off (default) |
 // console | otlp (to OTEL_EXPORTER_OTLP_ENDPOINT, default localhost:4317). Disposed at
@@ -420,6 +456,7 @@ while (true)
 }
 
 (llm as IDisposable)?.Dispose();
+foreach (var c in agentClients) c.Dispose();
 (store as IDisposable)?.Dispose();
 Console.WriteLine("bye.");
 return 0;
@@ -604,6 +641,19 @@ static string? DefaultModelFor(string provider) => provider switch
 //   local / ollama                -> RATCHET_LOCAL_API_KEY (optional), RATCHET_LOCAL_BASE_URL
 //   generic / unknown + RATCHET_BASE_URL -> RATCHET_API_KEY
 // RATCHET_BASE_URL overrides the base URL for any OpenAI-compatible provider (proxies, etc.).
+// Short model aliases in an agent's `model:` frontmatter resolve to concrete Anthropic ids;
+// other providers pass the value through (the id is the backend's own).
+static string MapModelAlias(string provider, string model) =>
+    provider is "anthropic" or "anthropic-native"
+        ? model.Trim().ToLowerInvariant() switch
+        {
+            "sonnet" => "claude-sonnet-4-6",
+            "opus" => "claude-opus-4-8",
+            "haiku" => "claude-haiku-4-5-20251001",
+            _ => model,
+        }
+        : model;
+
 static ILlmClient ResolveClient(string provider, string model)
 {
     static string? Env(string n) => Environment.GetEnvironmentVariable(n);
@@ -666,6 +716,8 @@ static string BuildSystemPrompt(string? handover, string skillList)
         "You can also delegate: call `explore` to hand a read-only investigation to a sub-agent " +
         "(it returns findings without filling your context), and the *_advisor tools to consult a " +
         "specialist for a second opinion (paste the relevant code into your question). " +
+        "Any project-defined agents (from .claude/agents or .ratchet/agents) appear as their own " +
+        "named tools — each runs in its own fresh context, so give it all the context it needs. " +
         "Keep going until the task is done, then stop and report briefly.";
 
     var sb = new StringBuilder(baseline);
