@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Ratchet.Cli\Ratchet.Cli.csproj" />
     <ProjectReference Include="..\..\src\Ratchet.Core\Ratchet.Core.csproj" />
     <ProjectReference Include="..\..\src\Ratchet.Llm\Ratchet.Llm.csproj" />
     <ProjectReference Include="..\..\src\Ratchet.Storage.Sqlite\Ratchet.Storage.Sqlite.csproj" />

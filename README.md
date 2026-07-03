@@ -230,6 +230,7 @@ and continue fresh), `/help`.
 | `RATCHET_SHELL` | shell the `bash` tool drives — `bash` / `cmd` / `pwsh` (default cmd on Windows, bash elsewhere) |
 | `RATCHET_STORE` | `sqlite` switches the session store to one `.ratchet/ratchet.db` (default: JSON files) |
 | `RATCHET_GATE` | `prompt` / `deny` turns on the permission gate for mutating tools (default: off, YOLO) |
+| `RATCHET_RENDER` | `md` renders assistant replies as formatted markdown (ANSI: headings, bold, code fences, lists, tables, OSC 8 links). Each message is buffered and rendered whole when it completes, so live token streaming is traded away; unset keeps today's raw cyan streaming |
 | `RATCHET_CONTEXT_LIMIT` | input-token threshold past which Ratchet auto-compacts into a self-handover |
 | `RATCHET_PTY` | `1` opts the `bash` tool into a Windows ConPTY pseudo-console (a real TTY) |
 | `RATCHET_TEST_CMD` | command `run_tests` invokes (default `dotnet test`) |

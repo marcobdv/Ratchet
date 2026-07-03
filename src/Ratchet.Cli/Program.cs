@@ -1,4 +1,5 @@
 using System.Text;
+using CodeStack.Ratchet.Cli;
 using CodeStack.Ratchet.Core;
 using CodeStack.Ratchet.Llm;
 using CodeStack.Ratchet.Storage.Sqlite;
@@ -199,7 +200,18 @@ baseTools.AddRange(roslyn.Tools);
 await using var mcp = await McpToolset.ConnectAsync(Directory.GetCurrentDirectory(), Console.WriteLine, CancellationToken.None);
 baseTools.AddRange(mcp.Tools);
 
-var observer = new ConsoleObserver();
+// Assistant-output rendering: RATCHET_RENDER=md formats the model's markdown with ANSI
+// (headings/bold/code/lists/tables). Block elements can't be styled from mid-token
+// fragments, so md mode buffers each assistant message and renders it whole on message
+// end — live token streaming is traded away. Unset (default) keeps raw live streaming,
+// byte-identical to before.
+MarkdownAnsiRenderer? mdRenderer = null;
+if ((Environment.GetEnvironmentVariable("RATCHET_RENDER")?.Trim().ToLowerInvariant()) == "md")
+{
+    VtConsole.TryEnable();   // classic conhost needs VT opted in; Windows Terminal has it on
+    mdRenderer = new MarkdownAnsiRenderer();
+}
+var observer = new ConsoleObserver(mdRenderer);
 
 // Permission gate. RATCHET_GATE = off (default, historical YOLO) | prompt (ask before
 // mutating tools: bash/write/edit/git_commit/git_create_branch/roslyn_rename) | deny
@@ -381,7 +393,7 @@ if (handoverContext is null && args.Any(a => a is "--continue" or "-c"))
     }
 }
 
-Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider}  ·  gate: {gate.ModeName}  ·  shell: {shell.Name}  ·  cwd: {Directory.GetCurrentDirectory()}");
+Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider}  ·  gate: {gate.ModeName}  ·  shell: {shell.Name}{(mdRenderer is not null ? "  ·  render: md" : "")}  ·  cwd: {Directory.GetCurrentDirectory()}");
 Console.WriteLine(recallTool is not null
     ? "Resumed from a handover — `recall` is available to page back into the prior session.\n"
     : "Type a request, or /help for commands. Ctrl+C to quit.\n");
@@ -429,12 +441,14 @@ while (true)
     }
     catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
     {
+        observer.FlushPending();   // md mode: show what was buffered rather than drop it
         Console.ForegroundColor = ConsoleColor.DarkGray;
         Console.WriteLine("\n  · turn cancelled");
         Console.ResetColor();
     }
     catch (Exception ex)
     {
+        observer.FlushPending();
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"[error] {ex.Message}");
         Console.ResetColor();
@@ -816,19 +830,52 @@ static string BuildSystemPrompt(string? handover, string skillList)
 /// </summary>
 sealed class ConsoleObserver : IAgentObserver
 {
+    // When set, assistant messages are buffered and rendered as formatted markdown on
+    // message end (RATCHET_RENDER=md) instead of streamed raw. Block elements (tables,
+    // fences, lists) can't be styled from mid-token fragments, hence whole-message.
+    private readonly MarkdownAnsiRenderer? _markdown;
+    private readonly StringBuilder _buffer = new();
+
+    public ConsoleObserver(MarkdownAnsiRenderer? markdown = null) => _markdown = markdown;
+
     /// <summary>Input tokens of the most recent model call — the auto-compaction signal.</summary>
     public int LastInputTokens { get; private set; }
 
     public void OnAssistantTextDelta(string delta)
     {
+        if (_markdown is not null) { _buffer.Append(delta); return; }
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.Write(delta);                 // no newline — fragments flow inline
     }
 
     public void OnAssistantTextEnd()
     {
+        if (_markdown is not null)
+        {
+            var raw = _buffer.ToString();
+            _buffer.Clear();
+            string rendered;
+            try { rendered = _markdown.Render(raw); }
+            catch { rendered = raw; }         // never worse than raw
+            Console.WriteLine(rendered);
+            return;
+        }
         Console.ResetColor();
         Console.WriteLine();                  // close the streamed line
+    }
+
+    /// <summary>
+    /// Emit any text buffered for markdown rendering as-is. Called when a turn is
+    /// cancelled or fails mid-message, so partial output is shown (raw) rather than
+    /// silently dropped or leaked into the next message's render.
+    /// </summary>
+    public void FlushPending()
+    {
+        if (_buffer.Length == 0) return;
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine(_buffer.ToString());
+        Console.ResetColor();
+        _buffer.Clear();
     }
 
     public void OnToolCall(string toolName, string inputJson)
@@ -950,6 +997,38 @@ sealed class ConsoleToolGate : IToolGate
             ? ToolGateDecision.Allow
             : ToolGateDecision.Deny("the user declined this action"));
     }
+}
+
+/// <summary>
+/// Opts the console into ANSI/VT escape processing on Windows. Windows Terminal has it
+/// on by default; classic conhost does not, and would print RATCHET_RENDER=md's escape
+/// sequences literally. Best-effort — failure just means the user sees raw codes.
+/// </summary>
+static class VtConsole
+{
+    public static void TryEnable()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            var handle = GetStdHandle(-11);   // STD_OUTPUT_HANDLE
+            if (GetConsoleMode(handle, out var mode))
+                SetConsoleMode(handle, mode | 0x0004);   // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        }
+        catch
+        {
+            // no console (redirected output) or an exotic host — nothing to do
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 }
 
 /// <summary>
