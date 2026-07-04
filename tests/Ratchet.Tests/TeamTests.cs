@@ -69,15 +69,41 @@ public sealed class TeamToolTests
     [Fact]
     public async Task MembersRunConcurrently_NotSequentially()
     {
-        // Three ~100ms members must finish well under 300ms if truly parallel.
-        var members = Enumerable.Range(0, 3).Select(i => (ITool)new Member($"m{i}", "ok", delayMs: 100)).ToList();
+        // Deterministic concurrency proof — no wall clock. Every member blocks until ALL
+        // of them have started: parallel dispatch releases the rendezvous, sequential
+        // dispatch leaves the first member waiting alone and trips the timeout. (The old
+        // form asserted 3×100ms delays finish <250ms, which flaked on loaded CI runners.)
+        const int n = 3;
+        var arrived = 0;
+        var everyoneArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var members = Enumerable.Range(0, n).Select(i => (ITool)new RendezvousMember($"m{i}", () =>
+        {
+            if (Interlocked.Increment(ref arrived) == n) everyoneArrived.TrySetResult();
+            return everyoneArrived.Task;
+        })).ToList();
         var team = new TeamTool("t", "d", members);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        await Run(team, "go");
-        sw.Stop();
+        var run = Run(team, "go");
+        var winner = await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(10)));
 
-        Assert.True(sw.ElapsedMilliseconds < 250, $"expected parallel (~100ms), took {sw.ElapsedMilliseconds}ms");
+        Assert.True(winner == run,
+            $"members never rendezvoused — {Volatile.Read(ref arrived)}/{n} started; dispatch looks sequential");
+        await run;
+    }
+
+    /// <summary>A member that waits at a caller-supplied rendezvous before answering.</summary>
+    private sealed class RendezvousMember : ITool
+    {
+        private readonly Func<Task> _rendezvous;
+        public RendezvousMember(string name, Func<Task> rendezvous) { Name = name; _rendezvous = rendezvous; }
+        public string Name { get; }
+        public string Description => "member";
+        public string InputSchemaJson => """{"type":"object","properties":{"task":{"type":"string"}},"required":["task"]}""";
+        public async Task<string> ExecuteAsync(string inputJson, CancellationToken ct)
+        {
+            await _rendezvous();
+            return "ok";
+        }
     }
 
     [Fact]
