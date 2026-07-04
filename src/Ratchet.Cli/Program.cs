@@ -359,10 +359,81 @@ if ((wfIdx >= 0 && wfIdx + 1 < args.Length) || (wfResumeIdx >= 0 && wfResumeIdx 
     return result.Status == RunStatus.Completed ? 0 : 2;
 }
 
+// Per-turn model routing (RATCHET_ROUTE=auto): the interactive exception ADR-0007
+// reserved (see docs/adr/0012). A cheap classify call picks a route from a readable
+// table (.ratchet/routing.json, or the built-in Anthropic ladder) before each human
+// turn; the routed client drives just that turn. Off by default; /model pins a model
+// and pauses it, /model auto resumes. Decisions are printed and appended to
+// .ratchet/route-log.jsonl so wrong defaults show up the same way workflow promotions do.
+TurnRouter? router = null;
+var routedClients = new Dictionary<string, ILlmClient>(StringComparer.OrdinalIgnoreCase);
+var routePinned = false;
+string? routeLogPath = null;
+if ((Environment.GetEnvironmentVariable("RATCHET_ROUTE")?.Trim().ToLowerInvariant()) is "auto" or "on" or "1")
+{
+    try
+    {
+        var table = RouteTable.Load(Directory.GetCurrentDirectory());
+        var classifierClient = ResolveClient(table.Classifier.Provider.Trim().ToLowerInvariant(), table.Classifier.Model);
+        if (classifierClient is IDisposable cd) agentClients.Add(cd);
+        router = new TurnRouter(classifierClient, table);
+        routeLogPath = Path.Combine(Directory.GetCurrentDirectory(), ".ratchet", "route-log.jsonl");
+        Console.WriteLine($"routing: auto — {table.Routes.Count} routes ({string.Join(", ", table.Routes.Select(r => r.Name))}), " +
+                          $"default {table.Default.Name}, classifier {table.Classifier.Tier}");
+    }
+    catch (Exception ex)
+    {
+        // A broken table or unreachable classifier disables routing loudly; the REPL
+        // still works on the session model.
+        Console.Error.WriteLine($"routing disabled: {ex.Message}");
+    }
+}
+
+// Resolve (and cache) the client for a route; null = unavailable, drive on the session model.
+ILlmClient? GetRoutedClient(RouteSpec route)
+{
+    if (routedClients.TryGetValue(route.Tier, out var cached)) return cached;
+    try
+    {
+        var created = ResolveClient(route.Provider.Trim().ToLowerInvariant(), route.Model);
+        if (created is IDisposable d) agentClients.Add(d);
+        routedClients[route.Tier] = created;
+        return created;
+    }
+    catch (Exception ex)
+    {
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine($"  · route '{route.Name}' unavailable ({ex.Message}) — using {provider} · {model}");
+        Console.ResetColor();
+        return null;
+    }
+}
+
+void LogRoute(RouteSpec route, string reason, string request)
+{
+    if (routeLogPath is null) return;
+    try
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(routeLogPath)!);
+        File.AppendAllText(routeLogPath, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            ts = DateTime.UtcNow,
+            route = route.Name,
+            provider = route.Provider,
+            model = route.Model,
+            reason,
+            request = request.Length > 120 ? request[..120] + "…" : request,
+        }) + Environment.NewLine);
+    }
+    catch { /* telemetry must never break a turn */ }
+}
+
 // The agent is rebuilt on compaction with a new system prompt + recall tool, so
 // construct it through a factory over the (mutable) systemPrompt and recallTool.
-Agent BuildAgent() =>
-    new(llm, new ToolRegistry(recallTool is null ? baseTools : baseTools.Append(recallTool)), systemPrompt, observer, gate);
+// The optional driver override is how a routed turn runs on its route's model
+// without disturbing the session-level client (/model, compaction, handover).
+Agent BuildAgent(ILlmClient? driver = null) =>
+    new(driver ?? llm, new ToolRegistry(recallTool is null ? baseTools : baseTools.Append(recallTool)), systemPrompt, observer, gate);
 
 var agent = BuildAgent();
 
@@ -393,7 +464,7 @@ if (handoverContext is null && args.Any(a => a is "--continue" or "-c"))
     }
 }
 
-Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider}  ·  gate: {gate.ModeName}  ·  shell: {shell.Name}{(mdRenderer is not null ? "  ·  render: md" : "")}  ·  cwd: {Directory.GetCurrentDirectory()}");
+Console.WriteLine($"ratchet v0  ·  model: {model}  ·  provider: {provider}  ·  gate: {gate.ModeName}  ·  shell: {shell.Name}{(mdRenderer is not null ? "  ·  render: md" : "")}{(router is not null ? "  ·  route: auto" : "")}  ·  cwd: {Directory.GetCurrentDirectory()}");
 Console.WriteLine(recallTool is not null
     ? "Resumed from a handover — `recall` is available to page back into the prior session.\n"
     : "Type a request, or /help for commands. Ctrl+C to quit.\n");
@@ -436,7 +507,21 @@ while (true)
     var completed = false;
     try
     {
-        await agent.RunTurnAsync(conversation, turnCts.Token);
+        // Routed turn: classify this request, drive it on the chosen route's model.
+        // The session agent (and /model choice) is untouched — the override lives for
+        // one turn. Any routing failure lands on the session model, never on an error.
+        var turnAgent = agent;
+        if (router is not null && !routePinned)
+        {
+            var (route, reason) = await router.RouteAsync(line, turnCts.Token);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  · route: {route.Name} → {route.Tier}  — {reason}");
+            Console.ResetColor();
+            LogRoute(route, reason, line);
+            if (GetRoutedClient(route) is { } routed) turnAgent = BuildAgent(routed);
+        }
+
+        await turnAgent.RunTurnAsync(conversation, turnCts.Token);
         completed = true;
     }
     catch (OperationCanceledException) when (turnCts.IsCancellationRequested)
@@ -544,8 +629,17 @@ async Task HandleCommandAsync(string input)
         case "/model":
             if (arg.Length == 0)
             {
-                Console.WriteLine($"  current: {provider} · {model}");
+                Console.WriteLine($"  current: {provider} · {model}" + (router is not null
+                    ? routePinned ? "  (routing paused — /model auto resumes)" : "  (routing: auto)"
+                    : ""));
                 Console.WriteLine("  usage: /model <id> | /model <provider> <id> | /model <provider>:<id>   (see `ratchet --models`)");
+                break;
+            }
+            if (arg.Trim().ToLowerInvariant() == "auto")
+            {
+                if (router is null) { Console.WriteLine("  routing is not enabled — start with RATCHET_ROUTE=auto"); break; }
+                routePinned = false;
+                Console.WriteLine("  routing resumed — each turn picks its route again");
                 break;
             }
             {
@@ -566,7 +660,13 @@ async Task HandleCommandAsync(string input)
                     llm = newClient;
                     provider = newProvider; model = newModel;
                     agent = BuildAgent();   // rebuild the REPL agent on the new client
-                    Console.WriteLine($"  switched to {provider} · {model}");
+                    if (router is not null)
+                    {
+                        // A manual choice is a pin: don't silently re-route past the human.
+                        routePinned = true;
+                        Console.WriteLine($"  switched to {provider} · {model}  (routing paused — /model auto resumes)");
+                    }
+                    else Console.WriteLine($"  switched to {provider} · {model}");
                 }
                 catch (Exception ex)
                 {
@@ -625,6 +725,7 @@ async Task HandleCommandAsync(string input)
             Console.WriteLine("  /resume <id>    load a session and continue");
             Console.WriteLine("  /new            start a fresh session");
             Console.WriteLine("  /model [id]     show or switch the model (e.g. /model opus, /model openrouter:openai/gpt-4o)");
+            Console.WriteLine("  /model auto     resume per-turn routing after a manual /model pin (RATCHET_ROUTE=auto)");
             Console.WriteLine("  /tree           show the session tree (► marks HEAD)");
             Console.WriteLine("  /rewind [n]     move HEAD back n turns; continue to branch");
             Console.WriteLine("  /goto <node>    jump HEAD to a node (e.g. another branch tip)");

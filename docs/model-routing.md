@@ -69,6 +69,11 @@ time. For **batch / unattended (dark-factory) runs — the actual target — the
 round trip is free**, so the cascade wins outright. Revisit only if an
 interactive, latency-bound use case appears.
 
+> *(Revisited: the REPL is that case, and it shipped as opt-in per-turn routing —
+> `RATCHET_ROUTE=auto`, a readable route table, predictive-only, `/model` pins.
+> See [ADR-0012](adr/0012-repl-turn-routing-the-interactive-exception.md); everything
+> below about the workflow's two layers is unchanged.)*
+
 ## Resolution: tier as a function of `(phase, work_type)`
 
 Model tier resolves by a fallback chain, most specific first:

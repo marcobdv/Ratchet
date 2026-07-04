@@ -217,7 +217,8 @@ can then pick a backend per-agent via `provider:` / `model:` — see
 ### In-session commands
 
 `/sessions`, `/resume <id>`, `/new`, `/model [id]` (show or switch the model mid-session —
-`/model opus`, `/model openrouter:openai/gpt-4o`), `/tree` (show the branch tree), `/rewind [n]`
+`/model opus`, `/model openrouter:openai/gpt-4o`; with routing on, a manual pick pins and
+`/model auto` resumes per-turn routing), `/tree` (show the branch tree), `/rewind [n]`
 (move HEAD back n turns), `/goto <node>` (jump to a branch tip), `/handover` (write a
 handover doc), `/handovers` (list them), `/compact` (fold this session into a handover
 and continue fresh), `/help`.
@@ -231,12 +232,29 @@ and continue fresh), `/help`.
 | `RATCHET_STORE` | `sqlite` switches the session store to one `.ratchet/ratchet.db` (default: JSON files) |
 | `RATCHET_GATE` | `prompt` / `deny` turns on the permission gate for mutating tools (default: off, YOLO) |
 | `RATCHET_RENDER` | `md` renders assistant replies as formatted markdown (ANSI: headings, bold, code fences, lists, tables, OSC 8 links). Each message is buffered and rendered whole when it completes, so live token streaming is traded away; unset keeps today's raw cyan streaming |
+| `RATCHET_ROUTE` | `auto` routes each REPL turn to the best model for the request: a cheap classify call picks from `.ratchet/routing.json` (or the built-in quick/standard/deep Anthropic ladder). Decisions are printed + logged to `.ratchet/route-log.jsonl`; `/model` pins, `/model auto` resumes ([ADR-0012](docs/adr/0012-repl-turn-routing-the-interactive-exception.md)) |
 | `RATCHET_CONTEXT_LIMIT` | input-token threshold past which Ratchet auto-compacts into a self-handover |
 | `RATCHET_PTY` | `1` opts the `bash` tool into a Windows ConPTY pseudo-console (a real TTY) |
 | `RATCHET_TEST_CMD` | command `run_tests` invokes (default `dotnet test`) |
 | `RATCHET_READ_MAX_BYTES` | cap on a single `read` (default 256 KB, then truncates with a notice) |
 | `RATCHET_OTEL` | `console` / `otlp` enables OpenTelemetry export (default: off) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP target (default `http://localhost:4317`) |
+
+With `RATCHET_ROUTE=auto`, a custom route table in `.ratchet/routing.json` (comments and
+trailing commas allowed) replaces the built-in ladder — e.g. local-first with a frontier
+escape hatch:
+
+```jsonc
+{
+  "classifier": { "provider": "local", "model": "qwen3-4b" },   // optional; defaults to the first route
+  "default": "standard",                                        // fallback when classification is unclear
+  "routes": [
+    { "name": "quick",    "description": "one-file edits, renames, quick questions", "provider": "local",     "model": "qwen3-coder-30b" },
+    { "name": "standard", "description": "ordinary implement/fix/test work",         "provider": "local",     "model": "devstral-small-2-24b" },
+    { "name": "deep",     "description": "architecture, multi-file, subtle bugs",    "provider": "anthropic", "model": "claude-opus-4-8" }
+  ]
+}
+```
 
 ## 🧰 Tools
 

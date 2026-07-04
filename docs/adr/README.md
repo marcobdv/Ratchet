@@ -32,6 +32,7 @@ think X" survives.
 | [0009](0009-readonly-subagents-by-structure.md) | YOLO by default, but delegated sub-agents are scoped read-only by *structure* | v0.9 / v0.11 | Accepted |
 | [0010](0010-stop-reason-policy-at-the-loop-boundary.md) | A stop-reason policy at the loop boundary (orphaned tool_use is closed, truncation refuses loudly) | v0.12 | Accepted |
 | [0011](0011-delegation-family-one-seam.md) | Sub-agents, teams, and council are one seam at three altitudes (council keeps the human in the synthesis seat) | v0.13 | Accepted |
+| [0012](0012-repl-turn-routing-the-interactive-exception.md) | Per-turn REPL routing — ADR-0007's reserved interactive exception, predictive-only, human outranks router | — | Accepted |
 
 ## The through-line
 
