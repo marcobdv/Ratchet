@@ -80,6 +80,28 @@ internal static class McpServeMode
             new RunInspectTool(runStore),
         };
 
+        // The council (ADR-0011) is delegation too — organized deliberation instead of
+        // execution — so it earns a spot on the wire: the caller brings a decision, the
+        // personas argue cold on Ratchet's models, and the Analysis Brief comes back
+        // (with a Decision Record template written to .ratchet/council for the human).
+        // Whatever claimed the `council` name is served: a project-defined council file
+        // overrides the built-in ad-hoc one, same as in the REPL. No serialization
+        // needed — deliberation reads the repo, it doesn't edit it.
+        if (baseTools.FirstOrDefault(t => t.Name == "council") is { } council)
+            tools.Add(new RelabeledTool(
+                "ratchet_council",
+                "Convene Ratchet's deliberation council on an architectural decision with no prior art. " +
+                "Independent personas argue from COLD, separate contexts on Ratchet's (typically local) " +
+                "models; a clerk organizes their locked outputs into an Analysis Brief — consensus, " +
+                "contradictions, blind spots — WITHOUT a recommendation; a Decision Record template is " +
+                "written to .ratchet/council for the human to complete. Pass `decision` with ALL context " +
+                "(constraints, options, what makes it novel) — the personas see nothing but that text and " +
+                "the repo. If the schema offers `members`, you may name the roster (defined agents and/or " +
+                "built-in personas: architect, skeptic, developer, domain); a fixed-roster council ignores " +
+                "it. Use it BEFORE implementing when a choice is genuinely open; the deliberation is the " +
+                "product, the decision stays with the human.",
+                council));
+
         Console.WriteLine($"ratchet --mcp-serve  ·  gate: {gateModeName}  ·  cwd: {cwd}" +
             (string.IsNullOrWhiteSpace(workflowFile) ? "" : $"  ·  implement workflow: {workflowFile}"));
 
@@ -91,7 +113,9 @@ internal static class McpServeMode
                 "Ratchet is a coding agent living inside this repository, running on its own " +
                 "(typically local/cheap) models. Delegate implementation to it with ratchet_implement " +
                 "(pass a complete, self-contained plan), smaller jobs with ratchet_task, and inspect " +
-                "past workflow runs with ratchet_run.",
+                "past workflow runs with ratchet_run. For an architectural decision with no prior art, " +
+                "convene ratchet_council first — independent cold perspectives organized into an " +
+                "Analysis Brief; the human decides.",
             new ModelContextProtocol.Server.StreamServerTransport(protocolIn, protocolOut, "ratchet"),
             ct).ConfigureAwait(false);
 

@@ -18,6 +18,31 @@ public interface IProgressTool : ITool
 }
 
 /// <summary>
+/// Wraps an <see cref="ITool"/> under a different name/description for serving — an
+/// in-process tool built for Ratchet's own model (e.g. `council`) usually wants an
+/// exported name (`ratchet_council`) and a description written for the REMOTE caller,
+/// which starts cold and needs to be told what context to pass. Execution is untouched.
+/// </summary>
+public sealed class RelabeledTool : ITool
+{
+    private readonly ITool _inner;
+
+    public RelabeledTool(string name, string description, ITool inner)
+    {
+        Name = name;
+        Description = description;
+        _inner = inner;
+    }
+
+    public string Name { get; }
+    public string Description { get; }
+    public string InputSchemaJson => _inner.InputSchemaJson;
+
+    public Task<string> ExecuteAsync(string inputJson, CancellationToken ct) =>
+        _inner.ExecuteAsync(inputJson, ct);
+}
+
+/// <summary>
 /// Serves Ratchet <see cref="ITool"/>s over the Model Context Protocol — the exact inverse
 /// of <see cref="McpToolset"/> (which adapts MCP server tools into <see cref="ITool"/>s).
 /// The same seam, pointed outward: any MCP client (Claude Code, VS Code, another Ratchet)

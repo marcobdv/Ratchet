@@ -142,6 +142,29 @@ public sealed class McpServeTests : IAsyncDisposable
         Assert.Single(b.Inputs);
     }
 
+    [Fact]
+    public async Task RelabeledTool_ServesUnderTheNewName_ExecutionUntouched()
+    {
+        // How the council goes on the wire: in-process name `council`, served as
+        // `ratchet_council` with a caller-facing description; same schema, same execution.
+        var inner = new RecordingTool("council", _ => "Analysis Brief: …");
+        var relabeled = new RelabeledTool("ratchet_council", "convene the council", inner);
+        await using var client = await StartAsync(relabeled);
+
+        var tools = await client.ListToolsAsync(cancellationToken: CancellationToken.None);
+        var listed = Assert.Single(tools);
+        Assert.Equal("ratchet_council", listed.Name);
+        Assert.Equal("convene the council", listed.Description);
+
+        var result = await client.CallToolAsync(
+            "ratchet_council",
+            new Dictionary<string, object?> { ["decision"] = "storage layer: sqlite vs files" },
+            cancellationToken: CancellationToken.None);
+
+        Assert.Contains("Analysis Brief", string.Concat(result.Content.OfType<TextContentBlock>().Select(c => c.Text)));
+        Assert.Contains("sqlite vs files", Assert.Single(inner.Inputs));
+    }
+
     /// <summary>An IProgressTool that reports two milestones, then finishes.</summary>
     private sealed class MilestoneTool : IProgressTool
     {

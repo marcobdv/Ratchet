@@ -330,6 +330,11 @@ read/edit/bash; what it lacks is "run this to completion on another model"):
   workflow (classification, gates, per-tier cost) instead of a single turn.
 - **`ratchet_task`** — a smaller one-shot job (focused edit, codebase question).
 - **`ratchet_run`** — inspect recorded workflow runs (read-only audit trail).
+- **`ratchet_council`** — convene the deliberation council on an open architectural
+  decision: independent cold personas (on Ratchet's models) argue, the clerk returns an
+  Analysis Brief, and a Decision Record template lands in `.ratchet/council` for the
+  human. A project-defined `council` agent overrides the built-in ad-hoc one, as in the
+  REPL.
 
 Long calls stream MCP **progress notifications** (every tool call / phase event + a 15s
 heartbeat) so the client's tool timeout keeps resetting. Implement/task calls are
