@@ -33,6 +33,7 @@ think X" survives.
 | [0010](0010-stop-reason-policy-at-the-loop-boundary.md) | A stop-reason policy at the loop boundary (orphaned tool_use is closed, truncation refuses loudly) | v0.12 | Accepted |
 | [0011](0011-delegation-family-one-seam.md) | Sub-agents, teams, and council are one seam at three altitudes (council keeps the human in the synthesis seat) | v0.13 | Accepted |
 | [0012](0012-repl-turn-routing-the-interactive-exception.md) | Per-turn REPL routing — ADR-0007's reserved interactive exception, predictive-only, human outranks router | — | Accepted |
+| [0013](0013-mcp-serve-coarse-delegation.md) | `--mcp-serve` exposes coarse delegation tools (implement/task/run), not the toolset | — | Accepted |
 
 ## The through-line
 

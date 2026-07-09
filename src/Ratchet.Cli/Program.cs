@@ -14,6 +14,19 @@ using OpenTelemetry.Trace;
 // Register MSBuild before any Roslyn MSBuildWorkspace type loads (must be first).
 MsBuildBootstrap.Ensure();
 
+// `ratchet --mcp-serve` (ADR-0013): stdout IS the JSON-RPC channel, so claim the raw
+// streams and redirect every console write (composition logs, observers, gate messages)
+// to stderr BEFORE anything below prints a byte. The transport gets the captured
+// streams directly — no dependency on what Console.Out points at afterwards.
+var mcpServeMode = args.Contains("--mcp-serve");
+Stream? mcpProtocolIn = null, mcpProtocolOut = null;
+if (mcpServeMode)
+{
+    mcpProtocolIn = Console.OpenStandardInput();
+    mcpProtocolOut = Console.OpenStandardOutput();
+    Console.SetOut(Console.Error);
+}
+
 // Roslyn pipeline self-check (no API key needed): `ratchet --roslyn-check`.
 if (args.Contains("--roslyn-check"))
 {
@@ -197,7 +210,8 @@ using var roslyn = new RoslynToolset(Directory.GetCurrentDirectory());
 baseTools.AddRange(roslyn.Tools);
 
 // MCP servers from .mcp.json: each server tool becomes a Ratchet ITool.
-await using var mcp = await McpToolset.ConnectAsync(Directory.GetCurrentDirectory(), Console.WriteLine, CancellationToken.None);
+await using var mcp = await McpToolset.ConnectAsync(Directory.GetCurrentDirectory(), Console.WriteLine, CancellationToken.None,
+    skipSelfServe: mcpServeMode);   // don't connect to our own .mcp.json entry — that recurses
 baseTools.AddRange(mcp.Tools);
 
 // Assistant-output rendering: RATCHET_RENDER=md formats the model's markdown with ANSI
@@ -281,6 +295,19 @@ if (!baseTools.Any(t => t.Name == "council"))
 // console | otlp (to OTEL_EXPORTER_OTLP_ENDPOINT, default localhost:4317). Disposed at
 // exit to flush spans/metrics. Covers both the REPL and workflow runs below.
 using var otel = OTel.Enable(Environment.GetEnvironmentVariable("RATCHET_OTEL"), "ratchet");
+
+// Serve the delegation tools (ratchet_implement / ratchet_task / ratchet_run) over MCP
+// on the stdio streams captured at startup. Runs until the client closes the pipe.
+if (mcpServeMode)
+{
+    var serveRc = await McpServeMode.RunAsync(
+        llm, baseTools, systemPrompt, observer, gate, gate.ModeName, store, shell, skills,
+        (p, m) => ResolveClient(p, m), mcpProtocolIn!, mcpProtocolOut!, CancellationToken.None);
+    (llm as IDisposable)?.Dispose();
+    foreach (var c in agentClients) c.Dispose();
+    (store as IDisposable)?.Dispose();
+    return serveRc;
+}
 
 // `ratchet --workflow <file.yaml> "<task>"` runs the task through a phased workflow
 // orchestrator (research→plan→implement→verify→review) instead of the single REPL

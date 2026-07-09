@@ -237,6 +237,7 @@ and continue fresh), `/help`.
 | `RATCHET_PTY` | `1` opts the `bash` tool into a Windows ConPTY pseudo-console (a real TTY) |
 | `RATCHET_TEST_CMD` | command `run_tests` invokes (default `dotnet test`) |
 | `RATCHET_READ_MAX_BYTES` | cap on a single `read` (default 256 KB, then truncates with a notice) |
+| `RATCHET_MCP_WORKFLOW` | workflow YAML that `ratchet_implement` runs when serving MCP (default: a single agent turn) |
 | `RATCHET_OTEL` | `console` / `otlp` enables OpenTelemetry export (default: off) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP target (default `http://localhost:4317`) |
 
@@ -295,6 +296,47 @@ carrying the load?" is answerable). Inspect with `ratchet --runs` / `ratchet --r
 config diff. The full design and rationale is
 [`docs/workflow-orchestration.md`](docs/workflow-orchestration.md); model routing is
 [`docs/model-routing.md`](docs/model-routing.md).
+
+## 🔌 Serving MCP — Ratchet inside Claude Code
+
+`ratchet --mcp-serve` turns Ratchet into an MCP server (stdio), so Claude Code can
+**delegate implementation to it headlessly**: the orchestrator plans on its
+subscription, Ratchet executes on local/cheap models
+([ADR-0013](docs/adr/0013-mcp-serve-coarse-delegation.md)). In the consuming repo's
+`.mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "ratchet": {
+      "command": "ratchet",
+      "args": ["--mcp-serve"],
+      "env": {
+        "RATCHET_PROVIDER": "local",
+        "RATCHET_MODEL": "qwen3-coder-30b"
+        // optional: "RATCHET_MCP_WORKFLOW": "workflows/planned.yaml" — implement runs
+        // the phased orchestrator (gates instead of a human) rather than one agent turn
+      }
+    }
+  }
+}
+```
+
+Three coarse tools are exposed — deliberately not the toolset (the caller has its own
+read/edit/bash; what it lacks is "run this to completion on another model"):
+
+- **`ratchet_implement`** — execute a complete, self-contained plan: edits files, runs
+  tests, returns a report + session id. With `RATCHET_MCP_WORKFLOW`, runs the phased
+  workflow (classification, gates, per-tier cost) instead of a single turn.
+- **`ratchet_task`** — a smaller one-shot job (focused edit, codebase question).
+- **`ratchet_run`** — inspect recorded workflow runs (read-only audit trail).
+
+Long calls stream MCP **progress notifications** (every tool call / phase event + a 15s
+heartbeat) so the client's tool timeout keeps resetting. Implement/task calls are
+serialized (one repo, one pair of hands), every call persists its session/run
+(`--resume` / `--run` work afterwards), and all of Ratchet's console output goes to
+stderr — visible in Claude Code's MCP logs. A serving process skips any `--mcp-serve`
+entry in its own `.mcp.json`, so listing Ratchet there for Claude Code is safe.
 
 ## 📊 Observability (OpenTelemetry)
 

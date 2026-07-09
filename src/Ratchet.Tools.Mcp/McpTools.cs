@@ -15,7 +15,8 @@ namespace CodeStack.Ratchet.Tools.Mcp;
 /// </summary>
 public static class McpToolset
 {
-    public static async Task<McpConnections> ConnectAsync(string workingDirectory, Action<string> log, CancellationToken ct)
+    public static async Task<McpConnections> ConnectAsync(string workingDirectory, Action<string> log, CancellationToken ct,
+        bool skipSelfServe = false)
     {
         var connections = new McpConnections();
 
@@ -41,6 +42,14 @@ public static class McpToolset
 
         foreach (var (name, server) in servers)
         {
+            // A ratchet --mcp-serve process must not connect to its own .mcp.json entry:
+            // each child would spawn another serving child, a process chain with no base case.
+            if (skipSelfServe && (server.Args?.Contains("--mcp-serve", StringComparer.OrdinalIgnoreCase) ?? false))
+            {
+                log($"mcp: skipped '{name}' (--mcp-serve entry — that's this process; connecting would recurse)");
+                continue;
+            }
+
             try
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
